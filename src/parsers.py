@@ -19,7 +19,7 @@ class FunctionInfo:
     end_line: int         # 1-indexed
     source_code: str
     language: str
-    calls: list = field(default_factory=list)  # raw call names as seen in code
+    calls: list[str] = field(default_factory=list)  # raw call names as seen in code
 
 
 # ---------------------------------------------------------------------------
@@ -81,89 +81,81 @@ class LanguageParser:
         functions: list[FunctionInfo] = []
         source_lines = source.splitlines()
 
-        def get_calls(func_node) -> list[str]:
-            """Collect call names reachable from func_node, not crossing nested boundaries."""
-            calls: list[str] = []
-            seen: set[str] = set()
+        def add_call(owner: Optional[FunctionInfo], node) -> None:
+            """Attribute a call node to its owning (named) function, deduped."""
+            if owner is None:
+                return
+            name = self._extract_call_name(node)
+            if name and name not in owner.calls:
+                owner.calls.append(name)
 
-            def visit(node):
-                if node.type in self.CALL_NODE_TYPES:
-                    name = self._extract_call_name(node)
-                    if name and name not in seen:
-                        calls.append(name)
-                        seen.add(name)
-                for child in node.children:
-                    if (
-                        child.type not in self.FUNCTION_NODE_TYPES
-                        and child.type not in self.CLASS_NODE_TYPES
-                    ):
-                        visit(child)
-
-            for child in func_node.children:
-                visit(child)
-            return calls
-
-        def walk(node, class_ctx: Optional[str] = None, name_hint: Optional[str] = None):
+        def walk(
+            node,
+            class_ctx: Optional[str] = None,
+            name_hint: Optional[str] = None,
+            owner: Optional[FunctionInfo] = None,
+        ):
             t = node.type
 
             # --- Class nodes: update class context, recurse ---
             if t in self.CLASS_NODE_TYPES:
                 cname = self._extract_class_name(node)
                 for child in node.children:
-                    walk(child, cname, None)
+                    walk(child, cname, None, owner)
                 return
 
             # --- Name-hint carriers (variable_declarator, field_definition, pair) ---
             if t in self.NAME_HINT_NODE_TYPES:
                 hint = self._extract_name_hint(node)
                 for child in node.children:
-                    walk(child, class_ctx, hint)
+                    walk(child, class_ctx, hint, owner)
                 return
 
             # --- Function / method nodes ---
             if t in self.FUNCTION_NODE_TYPES:
-                # Prefer explicit name over parent hint
-                fname = self._extract_function_name(node) or name_hint
-                # Go: derive class from receiver
-                recv_class = self._extract_receiver_class(node)
-                class_name = recv_class or class_ctx
-
-                # C++: qualified name like ClassName::method
-                cpp_class, fname = self._split_qualified_cpp_name(fname, class_name)
-                if cpp_class:
-                    class_name = cpp_class
-
+                class_name, fname = self._resolve_function_identity(
+                    node, class_ctx, name_hint
+                )
+                # A named function becomes the owner for calls in its body. An
+                # anonymous function (no resolvable name) gets no node of its
+                # own, so its calls roll up into the enclosing named function —
+                # otherwise callback/lambda bodies vanish from the flow.
+                body_owner = owner
                 if fname:
-                    start = node.start_point[0]
-                    end = node.end_point[0]
-                    src = "\n".join(source_lines[start : end + 1])
+                    start_line = node.start_point[0]
+                    end_line = node.end_point[0]
+                    start_col = node.start_point[1]
+                    src = "\n".join(source_lines[start_line : end_line + 1])
                     qualified = f"{class_name}.{fname}" if class_name else fname
-                    func_id = f"{file_path}::{qualified}::{start}"
+                    func_id = f"{file_path}::{qualified}::{start_line}:{start_col}"
 
-                    functions.append(
-                        FunctionInfo(
-                            id=func_id,
-                            name=fname,
-                            qualified_name=qualified,
-                            file=file_path,
-                            class_name=class_name,
-                            start_line=start + 1,
-                            end_line=end + 1,
-                            source_code=src,
-                            language=self.LANGUAGE_NAME,
-                            calls=get_calls(node),
-                        )
+                    body_owner = FunctionInfo(
+                        id=func_id,
+                        name=fname,
+                        qualified_name=qualified,
+                        file=file_path,
+                        class_name=class_name,
+                        start_line=start_line + 1,
+                        end_line=end_line + 1,
+                        source_code=src,
+                        language=self.LANGUAGE_NAME,
                     )
+                    functions.append(body_owner)
 
                 # Recurse into function body; reset class_ctx so inner functions
                 # aren't incorrectly attributed to the outer class
                 for child in node.children:
-                    walk(child, None, None)
+                    walk(child, None, None, body_owner)
                 return
+
+            # --- Call nodes: attribute to the current owner, then keep walking
+            #     (arguments may contain further calls / nested functions) ---
+            if t in self.CALL_NODE_TYPES:
+                add_call(owner, node)
 
             # --- Default: recurse ---
             for child in node.children:
-                walk(child, class_ctx, None)
+                walk(child, class_ctx, None, owner)
 
         walk(root)
         return functions
@@ -212,6 +204,21 @@ class LanguageParser:
     ) -> tuple[Optional[str], Optional[str]]:
         """C++: if name is 'ClassName::method', return ('ClassName', 'method')."""
         return None, name
+
+    def _resolve_function_identity(
+        self, node, class_ctx: Optional[str] = None, name_hint: Optional[str] = None
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Return (class_name, function_name) for a function node."""
+        fname = self._extract_function_name(node) or name_hint
+        recv_class = self._extract_receiver_class(node)
+        class_name = recv_class or class_ctx
+
+        # C++: qualified name like ClassName::method
+        cpp_class, fname = self._split_qualified_cpp_name(fname, class_name)
+        if cpp_class:
+            class_name = cpp_class
+
+        return class_name, fname
 
     def _extract_call_name(self, node) -> Optional[str]:
         """Extract called function/method name from a call node."""
@@ -279,7 +286,7 @@ class PythonParser(LanguageParser):
     LANGUAGE_NAME = "python"
     EXTENSIONS = [".py"]
     CLASS_NODE_TYPES = frozenset({"class_definition"})
-    FUNCTION_NODE_TYPES = frozenset({"function_definition"})
+    FUNCTION_NODE_TYPES = frozenset({"function_definition", "async_function_definition"})
     CALL_NODE_TYPES = frozenset({"call"})
 
     def _get_language(self):
@@ -297,8 +304,8 @@ class JavaScriptParser(LanguageParser):
     EXTENSIONS = [".js", ".mjs", ".cjs", ".jsx"]
     CLASS_NODE_TYPES = frozenset({"class_declaration", "class"})
     FUNCTION_NODE_TYPES = frozenset({
-        "function_declaration", "function", "arrow_function",
-        "method_definition", "generator_function_declaration",
+        "function_declaration", "function", "function_expression",
+        "arrow_function", "method_definition", "generator_function_declaration",
         "generator_function",
     })
     CALL_NODE_TYPES = frozenset({"call_expression", "new_expression"})
@@ -518,73 +525,15 @@ class CppParser(LanguageParser):
                 return scope.text.decode("utf-8")
         return None
 
-    def _extract_functions(self, root, source, file_path):
-        # Use a modified walk that also extracts C++ class from out-of-class definitions
-        functions: list[FunctionInfo] = []
-        source_lines = source.splitlines()
-
-        def get_calls(func_node):
-            calls: list[str] = []
-            seen: set[str] = set()
-
-            def visit(node):
-                if node.type in self.CALL_NODE_TYPES:
-                    n = self._extract_call_name(node)
-                    if n and n not in seen:
-                        calls.append(n)
-                        seen.add(n)
-                for child in node.children:
-                    if child.type not in self.FUNCTION_NODE_TYPES and child.type not in self.CLASS_NODE_TYPES:
-                        visit(child)
-
-            for child in func_node.children:
-                visit(child)
-            return calls
-
-        def walk(node, class_ctx=None, name_hint=None):
-            t = node.type
-            if t in self.CLASS_NODE_TYPES:
-                cname = self._extract_class_name(node)
-                for child in node.children:
-                    walk(child, cname, None)
-                return
-            if t in self.FUNCTION_NODE_TYPES:
-                fname = self._extract_function_name(node)
-                # For out-of-class definitions, extract class from qualified declarator
-                cpp_class = self._cpp_class_from_declarator(node)
-                class_name = cpp_class or class_ctx
-                if fname and "::" in fname:
-                    parts = fname.rsplit("::", 1)
-                    class_name = parts[0]
-                    fname = parts[1]
-                if fname:
-                    start = node.start_point[0]
-                    end = node.end_point[0]
-                    src = "\n".join(source_lines[start : end + 1])
-                    qualified = f"{class_name}.{fname}" if class_name else fname
-                    func_id = f"{file_path}::{qualified}::{start}"
-                    functions.append(
-                        FunctionInfo(
-                            id=func_id,
-                            name=fname,
-                            qualified_name=qualified,
-                            file=file_path,
-                            class_name=class_name,
-                            start_line=start + 1,
-                            end_line=end + 1,
-                            source_code="\n".join(source_lines[start : end + 1]),
-                            language=self.LANGUAGE_NAME,
-                            calls=get_calls(node),
-                        )
-                    )
-                for child in node.children:
-                    walk(child, None, None)
-                return
-            for child in node.children:
-                walk(child, class_ctx, None)
-
-        walk(root)
-        return functions
+    def _resolve_function_identity(self, node, class_ctx=None, name_hint=None):
+        fname = self._extract_function_name(node) or name_hint
+        cpp_class = self._cpp_class_from_declarator(node)
+        class_name = cpp_class or class_ctx
+        if fname and "::" in fname:
+            parts = fname.rsplit("::", 1)
+            class_name = parts[0]
+            fname = parts[1]
+        return class_name, fname
 
 
 # ---------------------------------------------------------------------------

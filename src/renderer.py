@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import html
 import json
 import urllib.request
-import os
 import hashlib
 from pathlib import Path
 from typing import Optional
@@ -361,6 +361,7 @@ select.tb-btn {{
   <div class="tb-sep"></div>
 
   <button class="tb-btn active" id="btn-possible" title="Toggle low-confidence edges">Possible edges</button>
+  <button class="tb-btn active" id="btn-external" title="Toggle external / stdlib / builtin calls">External calls</button>
 </div>
 
 <div id="main">
@@ -428,8 +429,7 @@ const cy = cytoscape({{
         'padding': '8px',
         'border-width': '0px',
         'text-max-width': '160px',
-        'text-wrap': 'none',
-        'text-overflow-wrap': 'ellipsis',
+        'text-wrap': 'ellipsis',
       }},
     }},
     {{
@@ -438,6 +438,21 @@ const cy = cytoscape({{
         'label': (ele) => ele.data('class_name')
           ? `${{ele.data('class_name')}}.${{ele.data('name')}}`
           : ele.data('name'),
+      }},
+    }},
+    {{
+      selector: 'node.external',
+      style: {{
+        'shape': 'round-tag',
+        'background-color': 'data(color)',
+        'background-opacity': 0.55,
+        'color': '#c8c8d8',
+        'font-style': 'italic',
+        'font-weight': '400',
+        'border-width': '1px',
+        'border-color': '#8a8aa6',
+        'border-style': 'dashed',
+        'height': '24px',
       }},
     }},
     {{
@@ -465,13 +480,13 @@ const cy = cytoscape({{
     {{
       selector: 'edge',
       style: {{
-        'width': 1.5,
-        'line-color': '#4a4a6a',
-        'target-arrow-color': '#4a4a6a',
+        'width': 2.5,
+        'line-color': '#7878b8',
+        'target-arrow-color': '#7878b8',
         'target-arrow-shape': 'triangle',
         'curve-style': 'bezier',
-        'opacity': 0.7,
-        'arrow-scale': 0.9,
+        'opacity': 0.85,
+        'arrow-scale': 1.1,
       }},
     }},
     {{
@@ -479,9 +494,19 @@ const cy = cytoscape({{
       style: {{
         'line-style': 'dashed',
         'line-dash-pattern': [5, 3],
-        'opacity': 0.35,
-        'line-color': '#6a6a8a',
-        'target-arrow-color': '#6a6a8a',
+        'opacity': 0.5,
+        'line-color': '#9090b8',
+        'target-arrow-color': '#9090b8',
+      }},
+    }},
+    {{
+      selector: 'edge.external',
+      style: {{
+        'line-style': 'dotted',
+        'opacity': 0.45,
+        'line-color': '#7070a0',
+        'target-arrow-color': '#7070a0',
+        'width': 1.5,
       }},
     }},
     {{
@@ -494,7 +519,7 @@ const cy = cytoscape({{
         'line-color': '#ffcc00',
         'target-arrow-color': '#ffcc00',
         'opacity': 1,
-        'width': 2.5,
+        'width': 3.5,
       }},
     }},
   ],
@@ -544,17 +569,25 @@ function showPanel(data) {{
   panelTitle.textContent = data.qualified_name || data.name;
   panelTitle.title = data.qualified_name || data.name;
 
+  const isExternal = data.language === 'external';
   const badge = `<span class="lang-badge" style="background:${{data.color}}">${{data.language}}</span>`;
   const file = data.relative_file || data.file;
   const lines = `L${{data.start_line}}–${{data.end_line}}`;
 
-  panelMeta.innerHTML = `
+  panelMeta.innerHTML = isExternal
+    ? `
+    <div class="info-row"><span class="info-label">Lang</span><span class="info-val">${{badge}}</span></div>
+    <div class="info-row"><span class="info-label">Kind</span><span class="info-val">External / stdlib / builtin (no definition in this project)</span></div>
+  `
+    : `
     <div class="info-row"><span class="info-label">Lang</span><span class="info-val">${{badge}}</span></div>
     <div class="info-row"><span class="info-label">File</span><span class="info-val" title="${{data.file}}">${{file}}</span></div>
     <div class="info-row"><span class="info-label">Lines</span><span class="info-val">${{lines}}</span></div>
     ${{data.class_name ? `<div class="info-row"><span class="info-label">Class</span><span class="info-val">${{data.class_name}}</span></div>` : ''}}
   `;
 
+  // External nodes have no source; hide the source block entirely for them.
+  document.getElementById('source-wrap').style.display = isExternal ? 'none' : '';
   sourceCode.textContent = data.source_code || '';
 
   // Callees
@@ -622,6 +655,18 @@ document.getElementById('btn-possible').addEventListener('click', function() {{
   showPossible = !showPossible;
   this.classList.toggle('active', showPossible);
   cy.edges('.possible').style('display', showPossible ? 'element' : 'none');
+}});
+
+// Toggle external (stdlib/builtin/third-party) nodes and their edges, then
+// re-run the current layout so the graph re-flows around what's left.
+let showExternal = true;
+document.getElementById('btn-external').addEventListener('click', function() {{
+  showExternal = !showExternal;
+  this.classList.toggle('active', showExternal);
+  const disp = showExternal ? 'element' : 'none';
+  cy.nodes('.external').style('display', disp);
+  cy.edges('.external').style('display', disp);
+  applyLayout(document.getElementById('layout-select').value);
 }});
 
 // ── Fuzzy search ──────────────────────────────────────────────────────────
@@ -721,9 +766,14 @@ document.addEventListener('keydown', e => {{
 }});
 
 // ── Status bar ────────────────────────────────────────────────────────────
-const files = new Set(GRAPH_DATA.nodes.map(n => n.file));
+const files = new Set(
+  GRAPH_DATA.nodes.filter(n => n.language !== 'external' && n.file).map(n => n.file)
+);
+const defCount = GRAPH_DATA.nodes.filter(n => n.language !== 'external').length;
+const extCount = GRAPH_DATA.nodes.length - defCount;
 document.getElementById('stat-nodes').textContent =
-  `${{GRAPH_DATA.nodes.length}} function${{GRAPH_DATA.nodes.length !== 1 ? 's' : ''}}`;
+  `${{defCount}} function${{defCount !== 1 ? 's' : ''}}` +
+  (extCount ? ` + ${{extCount}} external` : '');
 document.getElementById('stat-edges').textContent =
   `${{GRAPH_DATA.edges.length}} edge${{GRAPH_DATA.edges.length !== 1 ? 's' : ''}}`;
 document.getElementById('stat-files').textContent =
@@ -742,7 +792,13 @@ def render(graph: CallGraph, title: str) -> str:
     """Render a CallGraph to a fully self-contained HTML string."""
     js_bundle, is_inline = get_js_bundle()
     if not is_inline:
-        print("  [warn] Using CDN script tags – output may not be fully offline-capable.")
+        print(
+            "\n  " + "!" * 68 + "\n"
+            "  [WARNING] Could not inline JS libraries; falling back to CDN tags.\n"
+            "  The output file is NOT self-contained and REQUIRES internet access\n"
+            "  to open. Re-run with a network connection to embed the libraries.\n"
+            "  " + "!" * 68
+        )
 
     nodes_data = [
         {
@@ -775,10 +831,10 @@ def render(graph: CallGraph, title: str) -> str:
         {"nodes": nodes_data, "edges": edges_data},
         ensure_ascii=False,
         separators=(",", ":"),
-    )
+    ).replace("</", "<\\/")
 
     return HTML_TEMPLATE.format(
-        title=title,
+        title=html.escape(title, quote=True),
         js_bundle=js_bundle,
         graph_data=graph_data_json,
     )

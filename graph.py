@@ -13,6 +13,10 @@ import argparse
 import sys
 from pathlib import Path
 
+from src.parsers import parse_files, get_registry
+from src.graph_builder import build_graph
+from src.renderer import render
+
 
 SUPPORTED_EXTENSIONS = {
     ".py", ".js", ".mjs", ".cjs", ".jsx",
@@ -40,9 +44,13 @@ def collect_files(path: Path) -> list[Path]:
 
     files: list[Path] = []
     for f in path.rglob("*"):
+        if f.is_symlink():
+            continue
         if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS:
-            # Skip ignored directories
-            if any(part in IGNORE_DIRS for part in f.parts):
+            # Skip ignored directories. Only inspect path segments *below* the
+            # target root — otherwise an ancestor dir that happens to be named
+            # "build", "env", "target", etc. would wrongly exclude everything.
+            if any(part in IGNORE_DIRS for part in f.relative_to(path).parts):
                 continue
             files.append(f)
     return sorted(files)
@@ -63,6 +71,10 @@ def main():
         "--no-possible", action="store_true",
         help="Exclude low-confidence (ambiguous) call edges"
     )
+    parser.add_argument(
+        "--no-external", action="store_true",
+        help="Exclude external/stdlib/builtin calls (only show in-project functions)"
+    )
     args = parser.parse_args()
 
     target = Path(args.path).resolve()
@@ -79,7 +91,6 @@ def main():
 
     # Initialize parsers (lazy, printed once)
     print("Loading parsers…")
-    from src.parsers import parse_files, get_registry
     get_registry()  # triggers initialization and prints status
 
     # Parse
@@ -91,19 +102,21 @@ def main():
         sys.exit("Error: no functions found. Check that the source files contain parseable code.")
 
     # Build graph
-    from src.graph_builder import build_graph
     base_dir = str(target) if target.is_dir() else str(target.parent)
-    graph = build_graph(functions, base_dir)
-
-    if args.no_possible:
-        graph.edges = [e for e in graph.edges if e.confidence == "definite"]
+    graph = build_graph(
+        functions, base_dir,
+        include_possible=not args.no_possible,
+        include_external=not args.no_external,
+    )
 
     definite = sum(1 for e in graph.edges if e.confidence == "definite")
     possible = sum(1 for e in graph.edges if e.confidence == "possible")
-    print(f"Resolved {definite} definite edge(s), {possible} possible edge(s)")
+    external = sum(1 for e in graph.edges if e.confidence == "external")
+    ext_nodes = sum(1 for n in graph.nodes if n.language == "external")
+    print(f"Resolved {definite} definite edge(s), {possible} possible edge(s), "
+          f"{external} external edge(s) to {ext_nodes} external node(s)")
 
     # Render HTML
-    from src.renderer import render
     title = target.name
     print("Rendering HTML (may download JS libraries on first run)…")
     html = render(graph, title)

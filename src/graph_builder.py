@@ -48,9 +48,18 @@ LANGUAGE_COLORS = {
     "php":        "#b5cea8",
 }
 DEFAULT_COLOR = "#808080"
+# Muted colour for synthetic "external" nodes (stdlib / builtins / 3rd-party
+# calls that have no definition in the parsed set). Deliberately desaturated so
+# real function definitions remain the visual focus.
+EXTERNAL_COLOR = "#5a5a72"
 
 
-def build_graph(functions: list[FunctionInfo], base_dir: str = "") -> CallGraph:
+def build_graph(
+    functions: list[FunctionInfo],
+    base_dir: str = "",
+    include_possible: bool = True,
+    include_external: bool = True,
+) -> CallGraph:
     """
     Resolve function calls to edges and return a CallGraph.
 
@@ -58,7 +67,11 @@ def build_graph(functions: list[FunctionInfo], base_dir: str = "") -> CallGraph:
       1. Build name → [FunctionInfo] lookup (by simple name).
       2. For each call in a function, find all definitions with that name.
       3. Confidence: "definite" if exactly one match, "possible" if multiple.
-      4. Calls with no match in the parsed set are dropped (external/stdlib).
+      4. Calls with no match in the parsed set are *external* (stdlib / builtin /
+         third-party). When ``include_external`` is set we add one synthetic
+         node per unique external name (global dedup) plus an edge to it, so the
+         caller's full control flow — not just its in-project calls — is visible.
+         When disabled, such calls are dropped (legacy behaviour).
     """
     # Index by simple name and by qualified name
     by_name: dict[str, list[FunctionInfo]] = {}
@@ -87,36 +100,80 @@ def build_graph(functions: list[FunctionInfo], base_dir: str = "") -> CallGraph:
             )
         )
 
+    # Synthetic external nodes are created lazily and deduped by call name, so
+    # every call to e.g. ``print`` across the codebase converges on one node.
+    external_nodes: dict[str, GraphNode] = {}
+
+    def _external_node(name: str) -> GraphNode:
+        node = external_nodes.get(name)
+        if node is None:
+            node = GraphNode(
+                id=f"external::{name}",
+                name=name,
+                qualified_name=name,
+                file="",
+                relative_file="<external>",
+                class_name=None,
+                start_line=0,
+                end_line=0,
+                source_code="",
+                language="external",
+                color=EXTERNAL_COLOR,
+            )
+            external_nodes[name] = node
+        return node
+
     # Build edges
     edges: list[GraphEdge] = []
     seen_edges: set[tuple[str, str]] = set()
     edge_counter = 0
 
+    def _add_edge(source: str, target: str, confidence: str) -> None:
+        nonlocal edge_counter
+        key = (source, target)
+        if key in seen_edges:
+            return
+        seen_edges.add(key)
+        edges.append(
+            GraphEdge(
+                id=f"e{edge_counter}",
+                source=source,
+                target=target,
+                confidence=confidence,
+            )
+        )
+        edge_counter += 1
+
     for fn in functions:
         for call_name in fn.calls:
-            # Try qualified match first (e.g. "ClassName.method")
+            # call_name is always a *simple* identifier (the last segment of the
+            # callee expression). Prefer a free function whose qualified name is
+            # exactly that simple name (an unqualified call is more likely a free
+            # function than a method); only fall back to the broader by-name set
+            # — which also includes methods "Class.<name>" — when none exists.
             candidates = by_qualified.get(call_name, [])
             if not candidates:
                 candidates = by_name.get(call_name, [])
+
+            # No definition in the parsed set → external call.
+            if not candidates:
+                if include_external:
+                    _add_edge(fn.id, _external_node(call_name).id, "external")
+                continue
+
             # Drop calls that resolve only to themselves (unless they ARE recursive)
             candidates = [c for c in candidates if c.id != fn.id or len(candidates) == 1]
 
             confidence = "definite" if len(candidates) == 1 else "possible"
+            if confidence == "possible" and not include_possible:
+                continue
 
             for target in candidates:
-                key = (fn.id, target.id)
-                if key in seen_edges:
-                    continue
-                seen_edges.add(key)
-                edges.append(
-                    GraphEdge(
-                        id=f"e{edge_counter}",
-                        source=fn.id,
-                        target=target.id,
-                        confidence=confidence,
-                    )
-                )
-                edge_counter += 1
+                _add_edge(fn.id, target.id, confidence)
+
+    # Append external nodes after the real ones so layout/legend keep definitions
+    # first; only those actually referenced by an edge exist in the dict.
+    nodes.extend(external_nodes.values())
 
     return CallGraph(nodes=nodes, edges=edges)
 
