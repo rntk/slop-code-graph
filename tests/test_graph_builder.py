@@ -1,24 +1,23 @@
 """Tests for graph_builder.py."""
 
+from src.graph_builder import build_graph
 from src.parsers import FunctionInfo
-from src.graph_builder import build_graph, GraphNode, GraphEdge, CallGraph
 
 
 def make_fn(**kwargs):
-    defaults = {
-        "id": "f1",
-        "name": "foo",
-        "qualified_name": "foo",
-        "file": "/test.py",
-        "class_name": None,
-        "start_line": 1,
-        "end_line": 1,
-        "source_code": "def foo(): pass",
-        "language": "python",
-        "calls": [],
-    }
-    defaults.update(kwargs)
-    return FunctionInfo(**defaults)
+    return FunctionInfo(
+        id=kwargs.get("id", "f1"),
+        name=kwargs.get("name", "foo"),
+        qualified_name=kwargs.get("qualified_name", "foo"),
+        file=kwargs.get("file", "/test.py"),
+        class_name=kwargs.get("class_name"),
+        start_line=kwargs.get("start_line", 1),
+        end_line=kwargs.get("end_line", 1),
+        source_code=kwargs.get("source_code", "def foo(): pass"),
+        language=kwargs.get("language", "python"),
+        calls=kwargs.get("calls", []),
+        flow=kwargs.get("flow", []),
+    )
 
 
 def test_build_graph_basic():

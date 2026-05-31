@@ -3,11 +3,14 @@
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from src.parsers import (
-    PythonParser,
-    JavaScriptParser,
     FunctionInfo,
+    JavaScriptParser,
+    PythonParser,
     get_parser_for_file,
+    get_registry,
 )
 
 
@@ -134,10 +137,6 @@ def test_get_parser_for_file():
 # Control-flow ("block scheme" / flowchart) extraction
 # ---------------------------------------------------------------------------
 
-import pytest
-
-from src.parsers import get_registry
-
 
 def _parse_one(suffix, code, name="f"):
     """Parse `code`, returning the FunctionInfo named `name` (or None)."""
@@ -169,7 +168,9 @@ def _kinds(flow):
 
 
 def test_python_flow_structure():
-    fn = _parse_one(".py", """
+    fn = _parse_one(
+        ".py",
+        """
 def f(x):
     a = 1
     for i in range(x):
@@ -188,7 +189,8 @@ def f(x):
     finally:
         cleanup()
     return x
-""")
+""",
+    )
     flow = fn.flow
     # First a process block grouping the simple assignment.
     assert flow[0]["t"] == "process"
@@ -210,15 +212,39 @@ def f(x):
     assert {"loop", "if", "try", "jump", "process"} <= _kinds(flow)
 
 
-@pytest.mark.parametrize("suffix,code", [
-    (".py", "def f(x):\n  for i in range(x):\n    if i>1: continue\n    else: break\n  while x: x-=1\n  match x:\n    case 1: return 1\n    case _: g()\n  try: g()\n  except E: h()\n  return x\n"),
-    (".js", "function f(x){ for(let i=0;i<x;i++){ if(i>1){a()}else{break} } while(x){x--} switch(x){case 1: return 1; default: g()} try{g()}catch(e){h()} }"),
-    (".ts", "function f(x:number){ if(x>0){a()}else if(x<0){b()}else{c()} for(let i=0;i<x;i++){w()} while(x){x--} switch(x){case 1: return 1; default: c()} return x }"),
-    (".go", "package m\nfunc f(x int) int { for i:=0;i<x;i++ { if i>1 {continue} else {break} }; for x>0 {x--}; switch x {case 1: return 1; default: return 2} }"),
-    (".java", "class C{int f(int x){ for(int i=0;i<x;i++){if(i>1)continue; else break;} while(x>0)x--; switch(x){case 1: a(); break; default: b();} try{g();}catch(Exception e){h();}finally{c();} throw new E(); }}"),
-    (".cpp", "int f(int x){ for(int i=0;i<x;i++){if(i>1)continue; else break;} while(x>0)x--; switch(x){case 1: a(); break; default: b();} try{g();}catch(...){h();} throw 1; }"),
-    (".php", "<?php function f($x){ for($i=0;$i<$x;$i++){if($i>1){continue;}else{break;}} while($x>0){$x--;} switch($x){case 1: return 1; default: g();} try{g();}catch(E $e){h();}finally{c();} throw new E(); }"),
-])
+@pytest.mark.parametrize(
+    "suffix,code",
+    [
+        (
+            ".py",
+            "def f(x):\n  for i in range(x):\n    if i>1: continue\n    else: break\n  while x: x-=1\n  match x:\n    case 1: return 1\n    case _: g()\n  try: g()\n  except E: h()\n  return x\n",
+        ),
+        (
+            ".js",
+            "function f(x){ for(let i=0;i<x;i++){ if(i>1){a()}else{break} } while(x){x--} switch(x){case 1: return 1; default: g()} try{g()}catch(e){h()} }",
+        ),
+        (
+            ".ts",
+            "function f(x:number){ if(x>0){a()}else if(x<0){b()}else{c()} for(let i=0;i<x;i++){w()} while(x){x--} switch(x){case 1: return 1; default: c()} return x }",
+        ),
+        (
+            ".go",
+            "package m\nfunc f(x int) int { for i:=0;i<x;i++ { if i>1 {continue} else {break} }; for x>0 {x--}; switch x {case 1: return 1; default: return 2} }",
+        ),
+        (
+            ".java",
+            "class C{int f(int x){ for(int i=0;i<x;i++){if(i>1)continue; else break;} while(x>0)x--; switch(x){case 1: a(); break; default: b();} try{g();}catch(Exception e){h();}finally{c();} throw new E(); }}",
+        ),
+        (
+            ".cpp",
+            "int f(int x){ for(int i=0;i<x;i++){if(i>1)continue; else break;} while(x>0)x--; switch(x){case 1: a(); break; default: b();} try{g();}catch(...){h();} throw 1; }",
+        ),
+        (
+            ".php",
+            "<?php function f($x){ for($i=0;$i<$x;$i++){if($i>1){continue;}else{break;}} while($x>0){$x--;} switch($x){case 1: return 1; default: g();} try{g();}catch(E $e){h();}finally{c();} throw new E(); }",
+        ),
+    ],
+)
 def test_flow_covers_all_languages(suffix, code):
     fn = _parse_one(suffix, code)
     assert fn is not None, f"function not found for {suffix}"

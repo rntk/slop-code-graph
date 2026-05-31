@@ -13,25 +13,50 @@ import argparse
 import sys
 from pathlib import Path
 
-from src.parsers import parse_files, get_registry
 from src.graph_builder import build_graph
+from src.parsers import get_registry, parse_files
 from src.renderer import render
 
-
 SUPPORTED_EXTENSIONS = {
-    ".py", ".js", ".mjs", ".cjs", ".jsx",
-    ".ts", ".tsx",
+    ".py",
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".jsx",
+    ".ts",
+    ".tsx",
     ".go",
     ".java",
-    ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hxx", ".c++",
+    ".c",
+    ".cpp",
+    ".cc",
+    ".cxx",
+    ".h",
+    ".hpp",
+    ".hxx",
+    ".c++",
     ".php",
 }
 
 IGNORE_DIRS = {
-    ".git", ".svn", ".hg", "node_modules", "__pycache__",
-    ".mypy_cache", ".pytest_cache", ".tox", "venv", ".venv",
-    "env", ".env", "dist", "build", "target", "vendor",
-    ".idea", ".vscode",
+    ".git",
+    ".svn",
+    ".hg",
+    "node_modules",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".tox",
+    "venv",
+    ".venv",
+    "env",
+    ".env",
+    "dist",
+    "build",
+    "target",
+    "vendor",
+    ".idea",
+    ".vscode",
 }
 
 
@@ -39,8 +64,10 @@ def collect_files(path: Path) -> list[Path]:
     if path.is_file():
         if path.suffix.lower() in SUPPORTED_EXTENSIONS:
             return [path]
-        sys.exit(f"Error: unsupported file type '{path.suffix}'. "
-                 f"Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
+        sys.exit(
+            f"Error: unsupported file type '{path.suffix}'. "
+            f"Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
+        )
 
     files: list[Path] = []
     for f in path.rglob("*"):
@@ -64,16 +91,15 @@ def main():
     )
     parser.add_argument("path", help="Source file or directory to analyze")
     parser.add_argument(
-        "-o", "--output", default="graph.html",
-        help="Output HTML file (default: graph.html)"
+        "-o", "--output", default="graph.html", help="Output HTML file (default: graph.html)"
     )
     parser.add_argument(
-        "--no-possible", action="store_true",
-        help="Exclude low-confidence (ambiguous) call edges"
+        "--no-possible", action="store_true", help="Exclude low-confidence (ambiguous) call edges"
     )
     parser.add_argument(
-        "--no-external", action="store_true",
-        help="Exclude external/stdlib/builtin calls (only show in-project functions)"
+        "--no-external",
+        action="store_true",
+        help="Exclude external/stdlib/builtin calls (only show in-project functions)",
     )
     args = parser.parse_args()
 
@@ -104,7 +130,8 @@ def main():
     # Build graph
     base_dir = str(target) if target.is_dir() else str(target.parent)
     graph = build_graph(
-        functions, base_dir,
+        functions,
+        base_dir,
         include_possible=not args.no_possible,
         include_external=not args.no_external,
     )
@@ -113,8 +140,10 @@ def main():
     possible = sum(1 for e in graph.edges if e.confidence == "possible")
     external = sum(1 for e in graph.edges if e.confidence == "external")
     ext_nodes = sum(1 for n in graph.nodes if n.language == "external")
-    print(f"Resolved {definite} definite edge(s), {possible} possible edge(s), "
-          f"{external} external edge(s) to {ext_nodes} external node(s)")
+    print(
+        f"Resolved {definite} definite edge(s), {possible} possible edge(s), "
+        f"{external} external edge(s) to {ext_nodes} external node(s)"
+    )
 
     # Render HTML
     title = target.name

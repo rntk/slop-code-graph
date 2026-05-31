@@ -4,19 +4,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 
 @dataclass
 class FunctionInfo:
     """Represents a parsed function or method definition."""
-    id: str               # unique: "file::qualified_name::start_line"
-    name: str             # simple function name
-    qualified_name: str   # "ClassName.method" or "method"
-    file: str             # absolute path
-    class_name: Optional[str]
-    start_line: int       # 1-indexed
-    end_line: int         # 1-indexed
+
+    id: str  # unique: "file::qualified_name::start_line"
+    name: str  # simple function name
+    qualified_name: str  # "ClassName.method" or "method"
+    file: str  # absolute path
+    class_name: str | None
+    start_line: int  # 1-indexed
+    end_line: int  # 1-indexed
     source_code: str
     language: str
     calls: list[str] = field(default_factory=list)  # raw call names as seen in code
@@ -28,6 +28,7 @@ class FunctionInfo:
 # ---------------------------------------------------------------------------
 # Base parser
 # ---------------------------------------------------------------------------
+
 
 class LanguageParser:
     LANGUAGE_NAME = ""
@@ -44,18 +45,20 @@ class LanguageParser:
     # languages with different grammars override the relevant sets below.
     # ------------------------------------------------------------------
     IF_NODE_TYPES: frozenset = frozenset({"if_statement"})
-    ELIF_NODE_TYPES: frozenset = frozenset()        # e.g. Python elif_clause
+    ELIF_NODE_TYPES: frozenset = frozenset()  # e.g. Python elif_clause
     ELSE_NODE_TYPES: frozenset = frozenset({"else_clause"})
-    LOOP_NODE_TYPES: frozenset = frozenset(
-        {"for_statement", "while_statement", "do_statement"}
+    LOOP_NODE_TYPES: frozenset = frozenset({"for_statement", "while_statement", "do_statement"})
+    SWITCH_NODE_TYPES: frozenset = frozenset({"switch_statement", "switch_expression"})
+    CASE_NODE_TYPES: frozenset = frozenset(
+        {
+            "switch_case",
+            "switch_default",
+            "case_statement",
+            "default_statement",
+            "switch_block_statement_group",
+            "switch_rule",
+        }
     )
-    SWITCH_NODE_TYPES: frozenset = frozenset(
-        {"switch_statement", "switch_expression"}
-    )
-    CASE_NODE_TYPES: frozenset = frozenset({
-        "switch_case", "switch_default", "case_statement", "default_statement",
-        "switch_block_statement_group", "switch_rule",
-    })
     TRY_NODE_TYPES: frozenset = frozenset({"try_statement"})
     CATCH_NODE_TYPES: frozenset = frozenset({"catch_clause"})
     FINALLY_NODE_TYPES: frozenset = frozenset({"finally_clause"})
@@ -64,17 +67,25 @@ class LanguageParser:
     CONTINUE_NODE_TYPES: frozenset = frozenset({"continue_statement"})
     THROW_NODE_TYPES: frozenset = frozenset({"throw_statement"})
     # Body containers we descend through when collecting a statement sequence.
-    BLOCK_NODE_TYPES: frozenset = frozenset({
-        "block", "statement_block", "compound_statement",
-        "switch_body", "switch_block",
-    })
+    BLOCK_NODE_TYPES: frozenset = frozenset(
+        {
+            "block",
+            "statement_block",
+            "compound_statement",
+            "switch_body",
+            "switch_block",
+        }
+    )
     # Single-level wrappers that hold the real statements (Go: block→statement_list).
     WRAPPER_NODE_TYPES: frozenset = frozenset({"statement_list"})
     # Map a loop node type to a short kind label.
     LOOP_KIND: dict = {
-        "for_statement": "for", "while_statement": "while",
-        "do_statement": "do", "for_in_statement": "for",
-        "for_range_loop": "for", "foreach_statement": "foreach",
+        "for_statement": "for",
+        "while_statement": "while",
+        "do_statement": "do",
+        "for_in_statement": "for",
+        "for_range_loop": "for",
+        "foreach_statement": "foreach",
         "enhanced_for_statement": "for",
     }
     # Field name holding the function/method body.
@@ -91,7 +102,8 @@ class LanguageParser:
 
     def _init_parser(self):
         try:
-            from tree_sitter import Language, Parser
+            from tree_sitter import Parser
+
             lang = self._get_language()
             if lang is None:
                 return
@@ -99,7 +111,7 @@ class LanguageParser:
                 self._parser = Parser(lang)
             except TypeError:
                 self._parser = Parser()
-                self._parser.set_language(lang)
+                self._parser.set_language(lang)  # type: ignore[attr-defined]
         except Exception as e:
             print(f"  [warn] Could not init {self.LANGUAGE_NAME} parser: {e}")
 
@@ -112,6 +124,7 @@ class LanguageParser:
             return []
         try:
             source = file_path.read_text(encoding="utf-8", errors="replace")
+            assert self._parser is not None
             tree = self._parser.parse(bytes(source, "utf-8"))
             return self._extract_functions(tree.root_node, source, str(file_path))
         except Exception as e:
@@ -122,14 +135,12 @@ class LanguageParser:
     # Tree walker
     # ------------------------------------------------------------------
 
-    def _extract_functions(
-        self, root, source: str, file_path: str
-    ) -> list[FunctionInfo]:
+    def _extract_functions(self, root, source: str, file_path: str) -> list[FunctionInfo]:
         functions: list[FunctionInfo] = []
         source_lines = source.splitlines()
         src_bytes = source.encode("utf-8")
 
-        def add_call(owner: Optional[FunctionInfo], node) -> None:
+        def add_call(owner: FunctionInfo | None, node) -> None:
             """Attribute a call node to its owning (named) function, deduped."""
             if owner is None:
                 return
@@ -139,9 +150,9 @@ class LanguageParser:
 
         def walk(
             node,
-            class_ctx: Optional[str] = None,
-            name_hint: Optional[str] = None,
-            owner: Optional[FunctionInfo] = None,
+            class_ctx: str | None = None,
+            name_hint: str | None = None,
+            owner: FunctionInfo | None = None,
         ):
             t = node.type
 
@@ -161,9 +172,7 @@ class LanguageParser:
 
             # --- Function / method nodes ---
             if t in self.FUNCTION_NODE_TYPES:
-                class_name, fname = self._resolve_function_identity(
-                    node, class_ctx, name_hint
-                )
+                class_name, fname = self._resolve_function_identity(node, class_ctx, name_hint)
                 # A named function becomes the owner for calls in its body. An
                 # anonymous function (no resolvable name) gets no node of its
                 # own, so its calls roll up into the enclosing named function —
@@ -229,7 +238,7 @@ class LanguageParser:
                 return child.text.decode("utf-8")
         return "Unknown"
 
-    def _extract_function_name(self, node) -> Optional[str]:
+    def _extract_function_name(self, node) -> str | None:
         name_node = node.child_by_field_name("name")
         if name_node:
             return name_node.text.decode("utf-8")
@@ -238,7 +247,7 @@ class LanguageParser:
                 return child.text.decode("utf-8")
         return None
 
-    def _extract_name_hint(self, node) -> Optional[str]:
+    def _extract_name_hint(self, node) -> str | None:
         """Extract the lhs name from variable_declarator / pair / field_definition."""
         # variable_declarator: name field
         name_node = node.child_by_field_name("name")
@@ -251,19 +260,19 @@ class LanguageParser:
                 return kn.text.decode("utf-8")
         return None
 
-    def _extract_receiver_class(self, node) -> Optional[str]:
+    def _extract_receiver_class(self, node) -> str | None:
         """Go: extract class name from method receiver. Override in GoParser."""
         return None
 
     def _split_qualified_cpp_name(
-        self, name: Optional[str], class_ctx: Optional[str]
-    ) -> tuple[Optional[str], Optional[str]]:
+        self, name: str | None, class_ctx: str | None
+    ) -> tuple[str | None, str | None]:
         """C++: if name is 'ClassName::method', return ('ClassName', 'method')."""
         return None, name
 
     def _resolve_function_identity(
-        self, node, class_ctx: Optional[str] = None, name_hint: Optional[str] = None
-    ) -> tuple[Optional[str], Optional[str]]:
+        self, node, class_ctx: str | None = None, name_hint: str | None = None
+    ) -> tuple[str | None, str | None]:
         """Return (class_name, function_name) for a function node."""
         fname = self._extract_function_name(node) or name_hint
         recv_class = self._extract_receiver_class(node)
@@ -276,7 +285,7 @@ class LanguageParser:
 
         return class_name, fname
 
-    def _extract_call_name(self, node) -> Optional[str]:
+    def _extract_call_name(self, node) -> str | None:
         """Extract called function/method name from a call node."""
         # Try common field names for the callee
         for fname in ("function", "name"):
@@ -286,26 +295,36 @@ class LanguageParser:
         # Fallback: first named child that's not arguments
         for child in node.named_children:
             if child.type not in (
-                "argument_list", "arguments", "call_suffix", "argument",
+                "argument_list",
+                "arguments",
+                "call_suffix",
+                "argument",
             ):
                 result = self._name_from_expr(child)
                 if result:
                     return result
         return None
 
-    def _name_from_expr(self, node) -> Optional[str]:
+    def _name_from_expr(self, node) -> str | None:
         """Resolve a callee expression node to a simple name string."""
         t = node.type
         if t in (
-            "identifier", "property_identifier", "field_identifier",
-            "type_identifier", "namespace_identifier", "name",
+            "identifier",
+            "property_identifier",
+            "field_identifier",
+            "type_identifier",
+            "namespace_identifier",
+            "name",
         ):
             return node.text.decode("utf-8")
 
         # Member access – return the last identifier (method name)
         if t in (
-            "attribute", "member_expression", "selector_expression",
-            "field_expression", "member_access_expression",
+            "attribute",
+            "member_expression",
+            "selector_expression",
+            "field_expression",
+            "member_access_expression",
         ):
             for field_name in ("attribute", "property", "field"):
                 sub = node.child_by_field_name(field_name)
@@ -349,7 +368,7 @@ class LanguageParser:
 
     def _slice(self, node, src: bytes) -> str:
         """Decode a node's source slice, collapse whitespace, cap length."""
-        text = src[node.start_byte:node.end_byte].decode("utf-8", "replace")
+        text = src[node.start_byte : node.end_byte].decode("utf-8", "replace")
         text = " ".join(text.split())
         if len(text) > self._FLOW_LABEL_CAP:
             text = text[: self._FLOW_LABEL_CAP - 1] + "…"
@@ -365,12 +384,19 @@ class LanguageParser:
     def _looks_like_statement(self, node) -> bool:
         """Heuristic: is this named child a statement (vs. a keyword/expression)?"""
         t = node.type
-        if (t in self.BLOCK_NODE_TYPES or t in self.WRAPPER_NODE_TYPES
-                or t in self.IF_NODE_TYPES or t in self.ELIF_NODE_TYPES
-                or t in self.LOOP_NODE_TYPES or t in self.SWITCH_NODE_TYPES
-                or t in self.TRY_NODE_TYPES or t in self.RETURN_NODE_TYPES
-                or t in self.BREAK_NODE_TYPES or t in self.CONTINUE_NODE_TYPES
-                or t in self.THROW_NODE_TYPES):
+        if (
+            t in self.BLOCK_NODE_TYPES
+            or t in self.WRAPPER_NODE_TYPES
+            or t in self.IF_NODE_TYPES
+            or t in self.ELIF_NODE_TYPES
+            or t in self.LOOP_NODE_TYPES
+            or t in self.SWITCH_NODE_TYPES
+            or t in self.TRY_NODE_TYPES
+            or t in self.RETURN_NODE_TYPES
+            or t in self.BREAK_NODE_TYPES
+            or t in self.CONTINUE_NODE_TYPES
+            or t in self.THROW_NODE_TYPES
+        ):
             return True
         return t.endswith(("_statement", "_declaration", "_definition"))
 
@@ -391,9 +417,11 @@ class LanguageParser:
             if c is not None:
                 return c
         for child in node.named_children:
-            if (child.type in self.BLOCK_NODE_TYPES
-                    or child.type in self.WRAPPER_NODE_TYPES
-                    or child.type in self.IF_NODE_TYPES):
+            if (
+                child.type in self.BLOCK_NODE_TYPES
+                or child.type in self.WRAPPER_NODE_TYPES
+                or child.type in self.IF_NODE_TYPES
+            ):
                 return child
         return None
 
@@ -464,8 +492,7 @@ class LanguageParser:
         if t == "expression_statement":
             for ch in node.named_children:
                 if ch.type in self.THROW_NODE_TYPES:
-                    return {"t": "jump", "kind": "throw",
-                            "label": self._slice(node, src)}
+                    return {"t": "jump", "kind": "throw", "label": self._slice(node, src)}
         return None
 
     def _flow_branch(self, node, src: bytes) -> list:
@@ -483,8 +510,7 @@ class LanguageParser:
         return [emitted]
 
     def _flow_if(self, node, src: bytes) -> dict:
-        then_body = node.child_by_field_name("consequence") \
-            or node.child_by_field_name("body")
+        then_body = node.child_by_field_name("consequence") or node.child_by_field_name("body")
         alts = [
             node.children[i]
             for i in range(node.child_count)
@@ -510,12 +536,14 @@ class LanguageParser:
         a, rest = alts[0], alts[1:]
         t = a.type
         if t in self.ELIF_NODE_TYPES:
-            return [{
-                "t": "if",
-                "cond": self._cond_text(a, src),
-                "then": self._flow_branch(self._body_of(a), src),
-                "else": self._fold_alts(rest, src),
-            }]
+            return [
+                {
+                    "t": "if",
+                    "cond": self._cond_text(a, src),
+                    "then": self._flow_branch(self._body_of(a), src),
+                    "else": self._fold_alts(rest, src),
+                }
+            ]
         if t in self.ELSE_NODE_TYPES:
             return self._flow_branch(self._body_of(a), src) + self._fold_alts(rest, src)
         # Bare alternative (Go/Java): a block (else) or an if_statement (else-if).
@@ -524,7 +552,7 @@ class LanguageParser:
     def _flow_loop(self, node, src: bytes) -> dict:
         body = self._body_of(node)
         end = body.start_byte if body is not None else node.end_byte
-        header = src[node.start_byte:end].decode("utf-8", "replace")
+        header = src[node.start_byte : end].decode("utf-8", "replace")
         header = " ".join(header.split()).rstrip("{:( \t").strip()
         if len(header) > self._FLOW_LABEL_CAP:
             header = header[: self._FLOW_LABEL_CAP - 1] + "…"
@@ -546,10 +574,12 @@ class LanguageParser:
             collected: list = []
             for child in container.named_children:
                 if child.type in self.CASE_NODE_TYPES:
-                    collected.append({
-                        "label": self._case_label(child, src),
-                        "body": self._case_body(child, src),
-                    })
+                    collected.append(
+                        {
+                            "label": self._case_label(child, src),
+                            "body": self._case_body(child, src),
+                        }
+                    )
                 elif self._looks_like_statement(child) and collected:
                     # Statements between labels (fall-through grammar) attach to
                     # the most recent case.
@@ -563,7 +593,7 @@ class LanguageParser:
         """The `case X:` / `default:` header — text up to the first statement."""
         first = next(iter(self._statements(node)), None)
         end = first.start_byte if first is not None else node.end_byte
-        text = src[node.start_byte:end].decode("utf-8", "replace")
+        text = src[node.start_byte : end].decode("utf-8", "replace")
         text = " ".join(text.split()).rstrip("{: \t").strip()
         if not text:
             text = self._slice(node, src)
@@ -581,10 +611,12 @@ class LanguageParser:
         for child in node.named_children:
             if child.type in self.CATCH_NODE_TYPES:
                 hbody = child.child_by_field_name("body") or self._body_of(child)
-                handlers.append({
-                    "label": self._case_label(child, src),
-                    "body": self._flow_seq(hbody, src),
-                })
+                handlers.append(
+                    {
+                        "label": self._case_label(child, src),
+                        "body": self._flow_seq(hbody, src),
+                    }
+                )
             elif child.type in self.FINALLY_NODE_TYPES:
                 fbody = child.child_by_field_name("body") or self._body_of(child)
                 final = self._flow_seq(fbody, src)
@@ -599,6 +631,7 @@ class LanguageParser:
 # ---------------------------------------------------------------------------
 # Python
 # ---------------------------------------------------------------------------
+
 
 class PythonParser(LanguageParser):
     LANGUAGE_NAME = "python"
@@ -621,6 +654,7 @@ class PythonParser(LanguageParser):
     def _get_language(self):
         import tree_sitter_python as m
         from tree_sitter import Language
+
         return Language(m.language())
 
 
@@ -628,44 +662,64 @@ class PythonParser(LanguageParser):
 # JavaScript
 # ---------------------------------------------------------------------------
 
+
 class JavaScriptParser(LanguageParser):
     LANGUAGE_NAME = "javascript"
     EXTENSIONS = [".js", ".mjs", ".cjs", ".jsx"]
     CLASS_NODE_TYPES = frozenset({"class_declaration", "class"})
-    FUNCTION_NODE_TYPES = frozenset({
-        "function_declaration", "function", "function_expression",
-        "arrow_function", "method_definition", "generator_function_declaration",
-        "generator_function",
-    })
+    FUNCTION_NODE_TYPES = frozenset(
+        {
+            "function_declaration",
+            "function",
+            "function_expression",
+            "arrow_function",
+            "method_definition",
+            "generator_function_declaration",
+            "generator_function",
+        }
+    )
     CALL_NODE_TYPES = frozenset({"call_expression", "new_expression"})
-    NAME_HINT_NODE_TYPES = frozenset({
-        "variable_declarator", "pair", "field_definition",
-        "public_field_definition",
-    })
+    NAME_HINT_NODE_TYPES = frozenset(
+        {
+            "variable_declarator",
+            "pair",
+            "field_definition",
+            "public_field_definition",
+        }
+    )
 
     # Control flow: C-family defaults + JS for-of/for-in loops.
-    LOOP_NODE_TYPES = frozenset({
-        "for_statement", "while_statement", "do_statement", "for_in_statement",
-    })
+    LOOP_NODE_TYPES = frozenset(
+        {
+            "for_statement",
+            "while_statement",
+            "do_statement",
+            "for_in_statement",
+        }
+    )
 
     def _get_language(self):
         import tree_sitter_javascript as m
         from tree_sitter import Language
+
         return Language(m.language())
 
-    def _extract_function_name(self, node) -> Optional[str]:
+    def _extract_function_name(self, node) -> str | None:
         name_node = node.child_by_field_name("name")
         if name_node:
             return name_node.text.decode("utf-8")
         # method_definition may have property_identifier
         if node.type == "method_definition":
             for child in node.children:
-                if child.type in ("property_identifier", "identifier",
-                                  "private_property_identifier"):
+                if child.type in (
+                    "property_identifier",
+                    "identifier",
+                    "private_property_identifier",
+                ):
                     return child.text.decode("utf-8")
         return None
 
-    def _extract_call_name(self, node) -> Optional[str]:
+    def _extract_call_name(self, node) -> str | None:
         if node.type == "new_expression":
             ctor = node.child_by_field_name("constructor")
             if ctor:
@@ -677,17 +731,22 @@ class JavaScriptParser(LanguageParser):
 # TypeScript  (extends JS, adds function signatures)
 # ---------------------------------------------------------------------------
 
+
 class TypeScriptParser(JavaScriptParser):
     LANGUAGE_NAME = "typescript"
     EXTENSIONS = [".ts"]
-    FUNCTION_NODE_TYPES = JavaScriptParser.FUNCTION_NODE_TYPES | frozenset({
-        "function_signature", "method_signature",
-        "abstract_method_signature",
-    })
+    FUNCTION_NODE_TYPES = JavaScriptParser.FUNCTION_NODE_TYPES | frozenset(
+        {
+            "function_signature",
+            "method_signature",
+            "abstract_method_signature",
+        }
+    )
 
     def _get_language(self):
         import tree_sitter_typescript as m
         from tree_sitter import Language
+
         return Language(m.language_typescript())
 
 
@@ -698,6 +757,7 @@ class TSXParser(TypeScriptParser):
     def _get_language(self):
         import tree_sitter_typescript as m
         from tree_sitter import Language
+
         return Language(m.language_tsx())
 
 
@@ -705,24 +765,38 @@ class TSXParser(TypeScriptParser):
 # Go
 # ---------------------------------------------------------------------------
 
+
 class GoParser(LanguageParser):
     LANGUAGE_NAME = "go"
     EXTENSIONS = [".go"]
     CLASS_NODE_TYPES = frozenset()  # Go has no class keyword; use receiver
-    FUNCTION_NODE_TYPES = frozenset({
-        "function_declaration", "method_declaration", "func_literal",
-    })
+    FUNCTION_NODE_TYPES = frozenset(
+        {
+            "function_declaration",
+            "method_declaration",
+            "func_literal",
+        }
+    )
     CALL_NODE_TYPES = frozenset({"call_expression"})
 
     # Control flow: Go has no exceptions; else is a bare block/if (no else_clause).
     ELSE_NODE_TYPES = frozenset()
     LOOP_NODE_TYPES = frozenset({"for_statement"})
-    SWITCH_NODE_TYPES = frozenset({
-        "expression_switch_statement", "type_switch_statement", "select_statement",
-    })
-    CASE_NODE_TYPES = frozenset({
-        "expression_case", "default_case", "type_case", "communication_case",
-    })
+    SWITCH_NODE_TYPES = frozenset(
+        {
+            "expression_switch_statement",
+            "type_switch_statement",
+            "select_statement",
+        }
+    )
+    CASE_NODE_TYPES = frozenset(
+        {
+            "expression_case",
+            "default_case",
+            "type_case",
+            "communication_case",
+        }
+    )
     TRY_NODE_TYPES = frozenset()
     CATCH_NODE_TYPES = frozenset()
     FINALLY_NODE_TYPES = frozenset()
@@ -733,15 +807,16 @@ class GoParser(LanguageParser):
     def _get_language(self):
         import tree_sitter_go as m
         from tree_sitter import Language
+
         return Language(m.language())
 
-    def _extract_function_name(self, node) -> Optional[str]:
+    def _extract_function_name(self, node) -> str | None:
         name_node = node.child_by_field_name("name")
         if name_node:
             return name_node.text.decode("utf-8")
         return None
 
-    def _extract_receiver_class(self, node) -> Optional[str]:
+    def _extract_receiver_class(self, node) -> str | None:
         """Return the receiver type name for a Go method_declaration."""
         if node.type != "method_declaration":
             return None
@@ -761,36 +836,52 @@ class GoParser(LanguageParser):
 # Java
 # ---------------------------------------------------------------------------
 
+
 class JavaParser(LanguageParser):
     LANGUAGE_NAME = "java"
     EXTENSIONS = [".java"]
-    CLASS_NODE_TYPES = frozenset({
-        "class_declaration", "interface_declaration",
-        "enum_declaration", "record_declaration",
-        "annotation_type_declaration",
-    })
-    FUNCTION_NODE_TYPES = frozenset({
-        "method_declaration", "constructor_declaration",
-    })
-    CALL_NODE_TYPES = frozenset({
-        "method_invocation", "object_creation_expression",
-        "explicit_generic_invocation",
-    })
+    CLASS_NODE_TYPES = frozenset(
+        {
+            "class_declaration",
+            "interface_declaration",
+            "enum_declaration",
+            "record_declaration",
+            "annotation_type_declaration",
+        }
+    )
+    FUNCTION_NODE_TYPES = frozenset(
+        {
+            "method_declaration",
+            "constructor_declaration",
+        }
+    )
+    CALL_NODE_TYPES = frozenset(
+        {
+            "method_invocation",
+            "object_creation_expression",
+            "explicit_generic_invocation",
+        }
+    )
 
     # Control flow: Java uses bare block/if for else (no else_clause) and
     # enhanced-for; switch is a switch_expression with statement groups.
     ELSE_NODE_TYPES = frozenset()
-    LOOP_NODE_TYPES = frozenset({
-        "for_statement", "enhanced_for_statement",
-        "while_statement", "do_statement",
-    })
+    LOOP_NODE_TYPES = frozenset(
+        {
+            "for_statement",
+            "enhanced_for_statement",
+            "while_statement",
+            "do_statement",
+        }
+    )
 
     def _get_language(self):
         import tree_sitter_java as m
         from tree_sitter import Language
+
         return Language(m.language())
 
-    def _extract_call_name(self, node) -> Optional[str]:
+    def _extract_call_name(self, node) -> str | None:
         if node.type in ("method_invocation", "explicit_generic_invocation"):
             name_node = node.child_by_field_name("name")
             if name_node:
@@ -806,23 +897,33 @@ class JavaParser(LanguageParser):
 # C / C++
 # ---------------------------------------------------------------------------
 
+
 class CppParser(LanguageParser):
     LANGUAGE_NAME = "cpp"
     EXTENSIONS = [".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hxx", ".c++"]
     CLASS_NODE_TYPES = frozenset({"class_specifier", "struct_specifier"})
-    FUNCTION_NODE_TYPES = frozenset({
-        "function_definition", "lambda_expression",
-    })
+    FUNCTION_NODE_TYPES = frozenset(
+        {
+            "function_definition",
+            "lambda_expression",
+        }
+    )
     CALL_NODE_TYPES = frozenset({"call_expression"})
 
     # Control flow: C-family defaults + C++ range-for.
-    LOOP_NODE_TYPES = frozenset({
-        "for_statement", "while_statement", "do_statement", "for_range_loop",
-    })
+    LOOP_NODE_TYPES = frozenset(
+        {
+            "for_statement",
+            "while_statement",
+            "do_statement",
+            "for_range_loop",
+        }
+    )
 
     def _get_language(self):
         import tree_sitter_cpp as m
         from tree_sitter import Language
+
         return Language(m.language())
 
     def _extract_class_name(self, node) -> str:
@@ -831,7 +932,7 @@ class CppParser(LanguageParser):
             return name_node.text.decode("utf-8")
         return "Unknown"
 
-    def _name_from_declarator(self, node) -> Optional[str]:
+    def _name_from_declarator(self, node) -> str | None:
         t = node.type
         if t in ("identifier", "field_identifier"):
             return node.text.decode("utf-8")
@@ -861,7 +962,7 @@ class CppParser(LanguageParser):
             return node.text.decode("utf-8")
         return None
 
-    def _extract_function_name(self, node) -> Optional[str]:
+    def _extract_function_name(self, node) -> str | None:
         if node.type == "lambda_expression":
             return "<lambda>"
         decl = node.child_by_field_name("declarator")
@@ -870,14 +971,14 @@ class CppParser(LanguageParser):
         return self._name_from_declarator(decl)
 
     # For C++ out-of-class definitions (ClassName::method), also extract class
-    def _cpp_class_from_declarator(self, node) -> Optional[str]:
+    def _cpp_class_from_declarator(self, node) -> str | None:
         """If declarator is ClassName::method, return ClassName."""
         decl = node.child_by_field_name("declarator")
         if decl is None:
             return None
         return self._class_from_decl(decl)
 
-    def _class_from_decl(self, node) -> Optional[str]:
+    def _class_from_decl(self, node) -> str | None:
         if node.type == "function_declarator":
             inner = node.child_by_field_name("declarator")
             if inner:
@@ -903,52 +1004,79 @@ class CppParser(LanguageParser):
 # PHP
 # ---------------------------------------------------------------------------
 
+
 class PHPParser(LanguageParser):
     LANGUAGE_NAME = "php"
     EXTENSIONS = [".php"]
-    CLASS_NODE_TYPES = frozenset({
-        "class_declaration", "interface_declaration",
-        "trait_declaration", "enum_declaration",
-    })
-    FUNCTION_NODE_TYPES = frozenset({
-        "function_definition", "method_declaration", "arrow_function",
-    })
-    CALL_NODE_TYPES = frozenset({
-        "function_call_expression", "member_call_expression",
-        "scoped_call_expression", "object_creation_expression",
-        "nullsafe_member_call_expression",
-    })
+    CLASS_NODE_TYPES = frozenset(
+        {
+            "class_declaration",
+            "interface_declaration",
+            "trait_declaration",
+            "enum_declaration",
+        }
+    )
+    FUNCTION_NODE_TYPES = frozenset(
+        {
+            "function_definition",
+            "method_declaration",
+            "arrow_function",
+        }
+    )
+    CALL_NODE_TYPES = frozenset(
+        {
+            "function_call_expression",
+            "member_call_expression",
+            "scoped_call_expression",
+            "object_creation_expression",
+            "nullsafe_member_call_expression",
+        }
+    )
 
     # Control flow: PHP uses else_if_clause / else_clause and foreach.
     ELIF_NODE_TYPES = frozenset({"else_if_clause"})
     ELSE_NODE_TYPES = frozenset({"else_clause"})
-    LOOP_NODE_TYPES = frozenset({
-        "for_statement", "while_statement", "do_statement", "foreach_statement",
-    })
+    LOOP_NODE_TYPES = frozenset(
+        {
+            "for_statement",
+            "while_statement",
+            "do_statement",
+            "foreach_statement",
+        }
+    )
     CASE_NODE_TYPES = frozenset({"case_statement", "default_statement"})
     THROW_NODE_TYPES = frozenset({"throw_statement", "throw_expression"})
 
     def _get_language(self):
         import tree_sitter_php as m
         from tree_sitter import Language
+
         return Language(m.language_php_only())
 
-    def _extract_call_name(self, node) -> Optional[str]:
+    def _extract_call_name(self, node) -> str | None:
         t = node.type
         if t == "function_call_expression":
             func = node.child_by_field_name("function")
             if func:
                 return self._name_from_expr(func)
-        if t in ("member_call_expression", "scoped_call_expression",
-                 "nullsafe_member_call_expression"):
+        if t in (
+            "member_call_expression",
+            "scoped_call_expression",
+            "nullsafe_member_call_expression",
+        ):
             name_node = node.child_by_field_name("name")
             if name_node:
                 return name_node.text.decode("utf-8")
         if t == "object_creation_expression":
             # first named child is typically the class name
             for child in node.named_children:
-                if child.type in ("name", "qualified_name", "identifier",
-                                  "class_type_designator", "named_type"):
+                if child.type in (
+                    "name",
+                    "qualified_name",
+                    "identifier",
+                    "class_type_designator",
+                    "named_type",
+                ):
                     result = self._name_from_expr(child)
                     if result:
                         return result
@@ -959,11 +1087,18 @@ class PHPParser(LanguageParser):
 # Registry
 # ---------------------------------------------------------------------------
 
+
 def _build_registry() -> dict[str, LanguageParser]:
     registry: dict[str, LanguageParser] = {}
     parsers = [
-        PythonParser, JavaScriptParser, TypeScriptParser, TSXParser,
-        GoParser, JavaParser, CppParser, PHPParser,
+        PythonParser,
+        JavaScriptParser,
+        TypeScriptParser,
+        TSXParser,
+        GoParser,
+        JavaParser,
+        CppParser,
+        PHPParser,
     ]
     for cls in parsers:
         try:
@@ -978,7 +1113,7 @@ def _build_registry() -> dict[str, LanguageParser]:
     return registry
 
 
-_REGISTRY: Optional[dict[str, LanguageParser]] = None
+_REGISTRY: dict[str, LanguageParser] | None = None
 
 
 def get_registry() -> dict[str, LanguageParser]:
@@ -988,7 +1123,7 @@ def get_registry() -> dict[str, LanguageParser]:
     return _REGISTRY
 
 
-def get_parser_for_file(file_path: Path) -> Optional[LanguageParser]:
+def get_parser_for_file(file_path: Path) -> LanguageParser | None:
     return get_registry().get(file_path.suffix.lower())
 
 

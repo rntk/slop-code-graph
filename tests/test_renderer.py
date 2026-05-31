@@ -2,7 +2,7 @@
 
 import html
 
-from src.graph_builder import CallGraph, GraphNode, GraphEdge
+from src.graph_builder import CallGraph, GraphEdge, GraphNode
 from src.renderer import render
 
 
@@ -26,7 +26,7 @@ def test_render_escapes_title():
         edges=[],
     )
 
-    malicious_title = '<script>alert(1)</script>'
+    malicious_title = "<script>alert(1)</script>"
     html_out = render(graph, malicious_title)
 
     assert malicious_title not in html_out
@@ -99,13 +99,20 @@ def test_render_contains_graph_data():
 
 
 def _node(**kw):
-    defaults = dict(
-        id="n1", name="foo", qualified_name="foo", file="/test.py",
-        relative_file="test.py", class_name=None, start_line=1, end_line=1,
-        source_code="def foo(): pass", language="python", color="#4ec9b0",
+    return GraphNode(
+        id=kw.get("id", "n1"),
+        name=kw.get("name", "foo"),
+        qualified_name=kw.get("qualified_name", "foo"),
+        file=kw.get("file", "/test.py"),
+        relative_file=kw.get("relative_file", "test.py"),
+        class_name=kw.get("class_name"),
+        start_line=kw.get("start_line", 1),
+        end_line=kw.get("end_line", 1),
+        source_code=kw.get("source_code", "def foo(): pass"),
+        language=kw.get("language", "python"),
+        color=kw.get("color", "#4ec9b0"),
+        flow=kw.get("flow", []),
     )
-    defaults.update(kw)
-    return GraphNode(**defaults)
 
 
 def test_render_includes_flowchart_assets():

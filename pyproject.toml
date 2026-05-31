@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "callgraph"
+version = "0.1.0"
+description = "Generate an interactive, self-contained HTML call-graph from source code."
+requires-python = ">=3.12"
+dependencies = [
+    "tree-sitter>=0.25.0",
+    "tree-sitter-python>=0.25.0",
+    "tree-sitter-javascript>=0.25.0",
+    "tree-sitter-typescript>=0.23.0",
+    "tree-sitter-go>=0.25.0",
+    "tree-sitter-java>=0.23.0",
+    "tree-sitter-cpp>=0.23.0",
+    "tree-sitter-php>=0.24.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*", "graph*"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # Pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+]
+ignore = [
+    "E501", # line-too-long (handled by formatter)
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "lf"
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = false
+warn_unused_configs = true
+disallow_untyped_defs = false
+check_untyped_defs = true
+ignore_missing_imports = true
+strict_optional = true
+show_error_codes = true

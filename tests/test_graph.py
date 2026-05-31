@@ -3,7 +3,7 @@
 import tempfile
 from pathlib import Path
 
-from graph import collect_files, SUPPORTED_EXTENSIONS
+from graph import collect_files
 
 
 def test_collect_files_single_file():
@@ -24,11 +24,12 @@ def test_collect_files_unsupported_extension():
 
     import sys
     from io import StringIO
+
     old_stderr = sys.stderr
     sys.stderr = StringIO()
     try:
         collect_files(path)
-        assert False, "Expected SystemExit"
+        raise AssertionError("Expected SystemExit")
     except SystemExit as e:
         assert "unsupported file type" in str(e)
     finally:

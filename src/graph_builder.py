@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
 
 from .parsers import FunctionInfo
 
@@ -15,7 +14,7 @@ class GraphNode:
     qualified_name: str
     file: str
     relative_file: str
-    class_name: Optional[str]
+    class_name: str | None
     start_line: int
     end_line: int
     source_code: str
@@ -39,14 +38,14 @@ class CallGraph:
 
 
 LANGUAGE_COLORS = {
-    "python":     "#4ec9b0",
+    "python": "#4ec9b0",
     "javascript": "#dcdcaa",
     "typescript": "#569cd6",
-    "tsx":        "#4fc1ff",
-    "go":         "#9cdcfe",
-    "java":       "#ce9178",
-    "cpp":        "#c586c0",
-    "php":        "#b5cea8",
+    "tsx": "#4fc1ff",
+    "go": "#9cdcfe",
+    "java": "#ce9178",
+    "cpp": "#c586c0",
+    "php": "#b5cea8",
 }
 DEFAULT_COLOR = "#808080"
 # Muted colour for synthetic "external" nodes (stdlib / builtins / 3rd-party
@@ -185,6 +184,7 @@ def _relative_path(absolute: str, base_dir: str) -> str:
         return absolute
     try:
         from pathlib import Path
+
         return str(Path(absolute).relative_to(base_dir))
     except ValueError:
         return absolute

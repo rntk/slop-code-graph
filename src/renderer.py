@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import urllib.request
-import hashlib
 from pathlib import Path
-from typing import Optional
 
-from .graph_builder import CallGraph, GraphNode, GraphEdge
+from .graph_builder import CallGraph
 
 # ---------------------------------------------------------------------------
 # JS library fetching
@@ -25,7 +24,7 @@ LIBS = {
 CACHE_DIR = Path.home() / ".cache" / "callgraph"
 
 
-def _fetch_lib(name: str, url: str) -> Optional[str]:
+def _fetch_lib(name: str, url: str) -> str | None:
     """Download a JS library and cache it locally. Returns content or None."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
@@ -1038,6 +1037,7 @@ FLOW_SCRIPT = r"""
 # ---------------------------------------------------------------------------
 # Renderer
 # ---------------------------------------------------------------------------
+
 
 def render(graph: CallGraph, title: str) -> str:
     """Render a CallGraph to a fully self-contained HTML string."""
