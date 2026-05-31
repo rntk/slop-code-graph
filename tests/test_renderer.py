@@ -96,3 +96,30 @@ def test_render_contains_graph_data():
     assert "My Graph" in html_out
     assert "n1" in html_out
     assert "def foo(): pass" in html_out
+
+
+def _node(**kw):
+    defaults = dict(
+        id="n1", name="foo", qualified_name="foo", file="/test.py",
+        relative_file="test.py", class_name=None, start_line=1, end_line=1,
+        source_code="def foo(): pass", language="python", color="#4ec9b0",
+    )
+    defaults.update(kw)
+    return GraphNode(**defaults)
+
+
+def test_render_includes_flowchart_assets():
+    graph = CallGraph(nodes=[_node()], edges=[])
+    out = render(graph, "t")
+    # The flowchart view markup, builder and entry button are all present.
+    for marker in ("flow-view", "buildElements", "btn-flow", "flow-cy", "View flowchart"):
+        assert marker in out, marker
+
+
+def test_render_embeds_flow_data():
+    flow = [{"t": "if", "cond": "x > 0", "then": [], "else": []}]
+    graph = CallGraph(nodes=[_node(flow=flow)], edges=[])
+    out = render(graph, "t")
+    # The structured flow rides along in the embedded GRAPH_DATA payload.
+    assert '"flow":' in out
+    assert '"cond":"x > 0"' in out

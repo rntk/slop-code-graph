@@ -330,6 +330,8 @@ select.tb-btn {{
 .sr-item:hover {{ background: #3c3c3c; }}
 .sr-name {{ color: #d4d4d4; font-weight: 500; }}
 .sr-file {{ color: #888; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+
+{flow_style}
 </style>
 </head>
 <body>
@@ -367,6 +369,17 @@ select.tb-btn {{
 <div id="main">
   <div id="cy"></div>
 
+  <div id="flow-view">
+    <div id="flow-bar">
+      <button class="tb-btn" id="flow-back">← Call graph</button>
+      <span id="flow-title"></span>
+      <span id="flow-hint">▭ step&nbsp;&nbsp;◆ condition&nbsp;&nbsp;⬡ loop&nbsp;&nbsp;↺ back-edge</span>
+      <span style="flex:1"></span>
+      <button class="tb-btn" id="flow-fit">Fit</button>
+    </div>
+    <div id="flow-cy"></div>
+  </div>
+
   <div id="panel">
     <div id="panel-header">
       <span id="panel-title"></span>
@@ -374,6 +387,7 @@ select.tb-btn {{
     </div>
     <div id="panel-body">
       <div id="panel-meta"></div>
+      <button class="tb-btn" id="btn-flow" style="display:none;width:100%;margin-bottom:4px">▦ View flowchart (conditions & loops) ▸</button>
       <div id="source-wrap">
         <div class="section-title">Source</div>
         <pre id="source-code"></pre>
@@ -779,8 +793,245 @@ document.getElementById('stat-edges').textContent =
 document.getElementById('stat-files').textContent =
   `${{files.size}} file${{files.size !== 1 ? 's' : ''}}`;
 </script>
+
+<script>
+{flow_script}
+</script>
 </body>
 </html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Flowchart ("block scheme") view — CSS + JS injected via plain placeholders so
+# we don't have to brace-escape this code for str.format().
+# ---------------------------------------------------------------------------
+
+FLOW_STYLE = """
+#main { position: relative; }
+#flow-view {
+  position: absolute; inset: 0; display: none; flex-direction: column;
+  background: #1a1a2e; z-index: 20;
+}
+#flow-view.open { display: flex; }
+#flow-bar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 12px; background: #252526; border-bottom: 1px solid #3c3c3c;
+  flex-shrink: 0;
+}
+#flow-title { font-weight: 600; font-size: 13px; color: #dcdcaa; }
+#flow-hint { font-size: 11px; color: #888; }
+#flow-cy {
+  flex: 1;
+  background: #1a1a2e;
+  background-image: radial-gradient(circle, #2a2a40 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+"""
+
+FLOW_SCRIPT = r"""
+(function () {
+  const flowView  = document.getElementById('flow-view');
+  const flowTitle = document.getElementById('flow-title');
+  const btnFlow   = document.getElementById('btn-flow');
+  let flowCy = null;
+  let uid = 0;
+  const nid = () => 'f' + (uid++);
+
+  // ── Convert a structured flow tree into Cytoscape elements ────────────────
+  // Each builder returns {entry, exits:[{id,label,cls}]}. Open exits are wired
+  // to whatever statement follows, so branches merge without extra junctions.
+  function buildElements(flow) {
+    const nodes = [], edges = [];
+    const addN = (id, label, cls, extra) =>
+      nodes.push({ data: Object.assign({ id, label: label || '' }, extra || {}), classes: cls });
+    const addE = (s, t, label, cls) => {
+      if (!s || !t) return;
+      edges.push({ data: { id: nid(), source: s, target: t, label: label || '' }, classes: cls || 'flow-edge' });
+    };
+
+    const entry = nid(); addN(entry, '▶ start', 'flow-entry');
+    const exit  = nid(); addN(exit,  '■ end',   'flow-exit');
+    const ctx0  = { loopCont: null, loopBreak: null, funcExit: exit };
+
+    function seq(stmts, ctx) {
+      let e = null, pend = [];
+      (stmts || []).forEach(s => {
+        const r = stmt(s, ctx);
+        if (!r) return;
+        if (e === null) e = r.entry;
+        pend.forEach(p => addE(p.id, r.entry, p.label, p.cls));
+        pend = r.exits;
+      });
+      return { entry: e, exits: pend };
+    }
+
+    function stmt(s, ctx) {
+      const t = s.t;
+      if (t === 'process') {
+        const id = nid(); addN(id, s.lines.join('\n'), 'flow-process');
+        return { entry: id, exits: [{ id }] };
+      }
+      if (t === 'jump') {
+        const id = nid(); addN(id, s.label, 'flow-jump flow-' + s.kind);
+        if (s.kind === 'return' || s.kind === 'throw') addE(id, ctx.funcExit, '', 'flow-edge');
+        else if (s.kind === 'break')    addE(id, ctx.loopBreak || ctx.funcExit, 'break', 'flow-jumpedge');
+        else if (s.kind === 'continue') addE(id, ctx.loopCont  || ctx.funcExit, 'continue', 'flow-jumpedge');
+        return { entry: id, exits: [] };
+      }
+      if (t === 'if') {
+        const d = nid(); addN(d, s.cond || '?', 'flow-decision');
+        const exits = [];
+        const tb = seq(s.then, ctx);
+        if (tb.entry) { addE(d, tb.entry, 'yes', 'flow-yes'); tb.exits.forEach(x => exits.push(x)); }
+        else exits.push({ id: d, label: 'yes', cls: 'flow-yes' });
+        const eb = seq(s.else, ctx);
+        if (eb.entry) { addE(d, eb.entry, 'no', 'flow-no'); eb.exits.forEach(x => exits.push(x)); }
+        else exits.push({ id: d, label: 'no', cls: 'flow-no' });
+        return { entry: d, exits };
+      }
+      if (t === 'loop') {
+        const h = nid();     addN(h, s.label || 'loop', 'flow-loop');
+        const le = nid();    addN(le, '', 'flow-connector');
+        const ctx2 = Object.assign({}, ctx, { loopCont: h, loopBreak: le });
+        const body = seq(s.body, ctx2);
+        if (s.do) {
+          const start = body.entry || h;
+          body.exits.forEach(x => addE(x.id, h, x.label, x.cls));
+          addE(h, body.entry || le, 'repeat', 'flow-yes flow-loopback');
+          addE(h, le, 'done', 'flow-no');
+          return { entry: start, exits: [{ id: le }] };
+        }
+        if (body.entry) {
+          addE(h, body.entry, 'loop', 'flow-yes');
+          body.exits.forEach(x => addE(x.id, h, '', 'flow-loopback'));
+        } else {
+          addE(h, h, '', 'flow-loopback');
+        }
+        addE(h, le, 'done', 'flow-no');
+        return { entry: h, exits: [{ id: le }] };
+      }
+      if (t === 'switch') {
+        const d  = nid(); addN(d, 'switch ' + (s.label || ''), 'flow-decision flow-switch');
+        const se = nid(); addN(se, '', 'flow-connector');
+        const ctx2 = Object.assign({}, ctx, { loopBreak: se });
+        let hasDefault = false;
+        (s.cases || []).forEach(c => {
+          if (/default|case _/i.test(c.label)) hasDefault = true;
+          const cb = seq(c.body, ctx2);
+          if (cb.entry) { addE(d, cb.entry, c.label, 'flow-case'); cb.exits.forEach(x => addE(x.id, se, x.label, x.cls)); }
+          else addE(d, se, c.label, 'flow-case');
+        });
+        if (!hasDefault) addE(d, se, 'default', 'flow-case');
+        return { entry: d, exits: [{ id: se }] };
+      }
+      if (t === 'try') {
+        const tn = nid(); addN(tn, 'try', 'flow-try');
+        const tm = nid(); addN(tm, '', 'flow-connector');
+        const body = seq(s.body, ctx);
+        if (body.entry) { addE(tn, body.entry, '', 'flow-edge'); body.exits.forEach(x => addE(x.id, tm, x.label, x.cls)); }
+        else addE(tn, tm, '', 'flow-edge');
+        (s.handlers || []).forEach(h => {
+          const hb = seq(h.body, ctx);
+          if (hb.entry) { addE(tn, hb.entry, h.label, 'flow-catch'); hb.exits.forEach(x => addE(x.id, tm, x.label, x.cls)); }
+          else addE(tn, tm, h.label, 'flow-catch');
+        });
+        let exits = [{ id: tm }];
+        if (s.final && s.final.length) {
+          const fb = seq(s.final, ctx);
+          if (fb.entry) { addE(tm, fb.entry, 'finally', 'flow-edge'); exits = fb.exits; }
+        }
+        return { entry: tn, exits };
+      }
+      const id = nid(); addN(id, t, 'flow-process');
+      return { entry: id, exits: [{ id }] };
+    }
+
+    const top = seq(flow, ctx0);
+    if (top.entry) { addE(entry, top.entry, '', 'flow-edge'); top.exits.forEach(x => addE(x.id, exit, x.label, x.cls)); }
+    else addE(entry, exit, '', 'flow-edge');
+
+    // Prune nodes unreachable from entry (e.g. dead code after an exhaustive
+    // switch/return) so the chart shows only the live flow — no floating nodes.
+    const adj = {};
+    edges.forEach(e => { (adj[e.data.source] = adj[e.data.source] || []).push(e.data.target); });
+    const seen = new Set([entry]); const stack = [entry];
+    while (stack.length) {
+      const n = stack.pop();
+      (adj[n] || []).forEach(m => { if (!seen.has(m)) { seen.add(m); stack.push(m); } });
+    }
+    return {
+      nodes: nodes.filter(n => seen.has(n.data.id)),
+      edges: edges.filter(e => seen.has(e.data.source) && seen.has(e.data.target)),
+    };
+  }
+
+  const FLOW_CY_STYLE = [
+    { selector: 'node', style: {
+        'label': 'data(label)', 'color': '#1e1e1e', 'font-size': '10px',
+        'font-family': 'Consolas, monospace', 'text-valign': 'center', 'text-halign': 'center',
+        'text-wrap': 'wrap', 'text-max-width': '200px', 'width': 'label', 'height': 'label',
+        'padding': '8px', 'background-color': '#9cdcfe', 'shape': 'round-rectangle' } },
+    { selector: '.flow-process',  style: { 'background-color': '#9cdcfe', 'shape': 'round-rectangle' } },
+    { selector: '.flow-decision', style: { 'background-color': '#dcdcaa', 'shape': 'diamond', 'text-max-width': '140px', 'padding': '14px' } },
+    { selector: '.flow-loop',     style: { 'background-color': '#c586c0', 'shape': 'hexagon', 'padding': '12px' } },
+    { selector: '.flow-entry',    style: { 'background-color': '#4ec9b0', 'shape': 'round-pentagon', 'color': '#10231f', 'font-weight': '700' } },
+    { selector: '.flow-exit',     style: { 'background-color': '#f48771', 'shape': 'round-rectangle', 'color': '#2a0f0a', 'font-weight': '700' } },
+    { selector: '.flow-jump',     style: { 'background-color': '#ce9178', 'shape': 'round-rectangle' } },
+    { selector: '.flow-return',   style: { 'background-color': '#f48771' } },
+    { selector: '.flow-throw',    style: { 'background-color': '#f44747', 'color': '#fff' } },
+    { selector: '.flow-break',    style: { 'background-color': '#d7ba7d' } },
+    { selector: '.flow-continue', style: { 'background-color': '#d7ba7d' } },
+    { selector: '.flow-try',      style: { 'background-color': '#608b4e', 'color': '#fff' } },
+    { selector: '.flow-connector',style: { 'width': '12px', 'height': '12px', 'background-color': '#7878b8', 'label': '' } },
+    { selector: 'edge', style: {
+        'width': 2, 'line-color': '#7878b8', 'target-arrow-color': '#7878b8',
+        'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'label': 'data(label)',
+        'font-size': '9px', 'color': '#cfcfe6', 'text-background-color': '#1a1a2e',
+        'text-background-opacity': 1, 'text-background-padding': '2px' } },
+    { selector: '.flow-yes', style: { 'line-color': '#4ec9b0', 'target-arrow-color': '#4ec9b0', 'color': '#7fe0cd' } },
+    { selector: '.flow-no',  style: { 'line-color': '#f48771', 'target-arrow-color': '#f48771', 'color': '#f4a791' } },
+    { selector: '.flow-loopback', style: {
+        'line-style': 'dashed', 'line-color': '#c586c0', 'target-arrow-color': '#c586c0',
+        'curve-style': 'unbundled-bezier', 'control-point-distances': [-60], 'control-point-weights': [0.5] } },
+    { selector: '.flow-case',  style: { 'color': '#dcdcaa' } },
+    { selector: '.flow-catch', style: { 'line-style': 'dashed', 'line-color': '#f44747', 'target-arrow-color': '#f44747', 'color': '#f48a8a' } },
+    { selector: '.flow-jumpedge', style: { 'line-style': 'dashed' } },
+  ];
+
+  function openFlow(data) {
+    if (!data || !data.flow || !data.flow.length) return;
+    uid = 0;
+    const els = buildElements(data.flow);
+    flowTitle.textContent = (data.qualified_name || data.name) + '()';
+    flowView.classList.add('open');
+    if (flowCy) { flowCy.destroy(); flowCy = null; }
+    flowCy = cytoscape({
+      container: document.getElementById('flow-cy'),
+      elements: els, style: FLOW_CY_STYLE,
+      minZoom: 0.05, maxZoom: 4, wheelSensitivity: 0.3,
+    });
+    flowCy.layout({ name: 'dagre', rankDir: 'TB', nodeSep: 28, rankSep: 48, edgeSep: 12 }).run();
+    flowCy.fit(undefined, 30);
+  }
+  function closeFlow() { flowView.classList.remove('open'); }
+
+  // ── Wiring ────────────────────────────────────────────────────────────────
+  function refreshBtn() {
+    const sel = cy.$('node:selected');
+    const ok = sel.length === 1 && sel.data('language') !== 'external'
+      && Array.isArray(sel.data('flow')) && sel.data('flow').length;
+    btnFlow.style.display = ok ? 'block' : 'none';
+  }
+  cy.on('select unselect', 'node', refreshBtn);
+  btnFlow.addEventListener('click', () => {
+    const sel = cy.$('node:selected');
+    if (sel.length) openFlow(sel.data());
+  });
+  document.getElementById('flow-back').addEventListener('click', closeFlow);
+  document.getElementById('flow-fit').addEventListener('click', () => { if (flowCy) flowCy.fit(undefined, 30); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && flowView.classList.contains('open')) { e.stopPropagation(); closeFlow(); } }, true);
+})();
 """
 
 
@@ -813,6 +1064,7 @@ def render(graph: CallGraph, title: str) -> str:
             "source_code": n.source_code,
             "language": n.language,
             "color": n.color,
+            "flow": n.flow or [],
         }
         for n in graph.nodes
     ]
@@ -837,4 +1089,6 @@ def render(graph: CallGraph, title: str) -> str:
         title=html.escape(title, quote=True),
         js_bundle=js_bundle,
         graph_data=graph_data_json,
+        flow_style=FLOW_STYLE,
+        flow_script=FLOW_SCRIPT,
     )

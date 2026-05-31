@@ -138,3 +138,18 @@ def test_build_graph_no_external_filter():
     assert len(graph.nodes) == 2
     assert len(graph.edges) == 1
     assert graph.edges[0].target == "f2"
+
+
+def test_flow_propagated_to_node():
+    flow = [{"t": "loop", "kind": "for", "label": "for i", "body": [], "do": False}]
+    fn = make_fn(id="f1", name="foo", flow=flow)
+    graph = build_graph([fn], include_external=False)
+    node = next(n for n in graph.nodes if n.id == "f1")
+    assert node.flow == flow
+
+
+def test_external_nodes_have_empty_flow():
+    f1 = make_fn(id="f1", name="foo", calls=["printf"])
+    graph = build_graph([f1], include_external=True)
+    ext = next(n for n in graph.nodes if n.language == "external")
+    assert ext.flow == []

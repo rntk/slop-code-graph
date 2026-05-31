@@ -21,6 +21,7 @@ class GraphNode:
     source_code: str
     language: str
     color: str
+    flow: list = field(default_factory=list)  # structured control-flow (flowchart)
 
 
 @dataclass
@@ -97,6 +98,7 @@ def build_graph(
                 source_code=fn.source_code,
                 language=fn.language,
                 color=LANGUAGE_COLORS.get(fn.language, DEFAULT_COLOR),
+                flow=fn.flow,
             )
         )
 

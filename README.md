@@ -118,3 +118,4 @@ Directories named `.git`, `node_modules`, `__pycache__`, `vendor`, `dist`, `buil
 - **Dashed edges** = low-confidence matches (multiple functions share the same name); toggle with the *Possible edges* button
 - **External nodes** = stdlib/builtin/third-party calls (muted, dashed outline) so the whole algorithm is visible; toggle with the *External calls* button
 - **Color-coded** by language
+- **Flowchart ("block scheme") view** — select any function and click **▦ View flowchart** in the side panel to drill into its internal control flow: a top-to-bottom flowchart with **◆ decision diamonds** for `if/elif/else` and `switch`/`match`, **⬡ loop nodes** with **↺ back-edges** for `for`/`while`/`do`/`foreach`, and distinct nodes for `return`/`break`/`continue`/`throw` and `try/catch/finally`. Works for all supported languages. Press *← Call graph* or `Esc` to return.
