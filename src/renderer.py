@@ -1,76 +1,628 @@
-"""Generate a fully self-contained HTML call-graph visualization."""
+"""Generate a fully self-contained HTML call-graph visualization.
+
+The visualization is rendered by a small, hand-written SVG graph engine that is
+embedded directly in the output (see ``ENGINE_SCRIPT``). It replaces the former
+runtime dependency on the Cytoscape.js / dagre / fuse.js CDN bundles, so the
+generated HTML has **no external dependencies whatsoever**: it ships its own
+graph data model, layered/force-directed/concentric layouts, pan/zoom/drag,
+fuzzy search and flowchart renderer. The file opens in any modern browser with
+no server and no network access.
+"""
 
 from __future__ import annotations
 
-import hashlib
 import html
 import json
-import urllib.request
-from pathlib import Path
 
 from .graph_builder import CallGraph
 
 # ---------------------------------------------------------------------------
-# JS library fetching
+# Embedded SVG graph engine  (replaces cytoscape + dagre + cytoscape-dagre)
 # ---------------------------------------------------------------------------
+# A minimal, dependency-free engine: a node/edge data model rendered to SVG,
+# three layouts (layered "dagre", force-directed "cose", "concentric"),
+# pan/zoom/drag, selection and CSS-class styling. Both the main call graph and
+# the flowchart view are built on top of it.
+#
+# Injected verbatim into the template (no str.format), so it must not contain
+# the literal sequence "</" (would prematurely close the <script>) or the
+# "@@...@@" placeholder tokens used by render().
 
-LIBS = {
-    "dagre": "https://unpkg.com/dagre@0.8.5/dist/dagre.min.js",
-    "cytoscape": "https://unpkg.com/cytoscape@3.29.2/dist/cytoscape.min.js",
-    "cytoscape-dagre": "https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js",
-    "fuse": "https://unpkg.com/fuse.js@7.0.0/dist/fuse.min.js",
+ENGINE_SCRIPT = r"""
+const SVGNS = 'http://www.w3.org/2000/svg';
+let GV_SEQ = 0;
+
+function svgEl(tag, attrs) {
+  const el = document.createElementNS(SVGNS, tag);
+  if (attrs) for (const k in attrs) el.setAttribute(k, attrs[k]);
+  return el;
 }
 
-CACHE_DIR = Path.home() / ".cache" / "callgraph"
+// Map a space-separated class string to a node shape (used by the flow view,
+// where shapes are derived from semantic classes rather than a callback).
+function shapeFromClasses(cls) {
+  if (/flow-decision|flow-switch/.test(cls)) return 'diamond';
+  if (/flow-loop/.test(cls))                 return 'hexagon';
+  if (/flow-entry/.test(cls))                return 'pentagon';
+  if (/flow-connector/.test(cls))            return 'ellipse';
+  return 'round-rectangle';
+}
 
+function sizeForShape(shape, tw, th) {
+  const PADX = 12, PADY = 8;
+  switch (shape) {
+    case 'diamond':  return { w: Math.max(60, tw * 1.8 + PADX), h: Math.max(44, th * 2 + PADY) };
+    case 'hexagon':  return { w: Math.max(60, tw + PADX * 2 + 24), h: Math.max(30, th + PADY * 2) };
+    case 'pentagon': return { w: Math.max(54, tw + PADX * 2), h: Math.max(32, th + PADY * 2 + 6) };
+    case 'ellipse':  return { w: 14, h: 14 };
+    default:         return { w: Math.max(40, tw + PADX * 2), h: Math.max(26, th + PADY * 2) };
+  }
+}
 
-def _fetch_lib(name: str, url: str) -> str | None:
-    """Download a JS library and cache it locally. Returns content or None."""
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
-    cache_file = CACHE_DIR / f"{name}-{url_hash}.js"
+function shapeEl(shape, w, h) {
+  const hw = w / 2, hh = h / 2;
+  const poly = (pts) => svgEl('polygon', { points: pts, class: 'shape' });
+  switch (shape) {
+    case 'diamond':  return poly(`0,${-hh} ${hw},0 0,${hh} ${-hw},0`);
+    case 'hexagon': {
+      const c = Math.min(hh, hw * 0.5);
+      return poly(`${-hw + c},${-hh} ${hw - c},${-hh} ${hw},0 ${hw - c},${hh} ${-hw + c},${hh} ${-hw},0`);
+    }
+    case 'pentagon': return poly(`${-hw},${-hh} ${hw},${-hh} ${hw},${hh * 0.3} 0,${hh} ${-hw},${hh * 0.3}`);
+    case 'ellipse':  return svgEl('circle', { r: hw, cx: 0, cy: 0, class: 'shape' });
+    case 'round-tag': return svgEl('rect', { x: -hw, y: -hh, width: w, height: h, rx: hh, ry: hh, class: 'shape' });
+    default:         return svgEl('rect', { x: -hw, y: -hh, width: w, height: h, rx: 6, ry: 6, class: 'shape' });
+  }
+}
 
-    if cache_file.exists():
-        return cache_file.read_text(encoding="utf-8")
+// Point on node n's bounding box on the ray toward (tx, ty).
+function borderPt(n, tx, ty) {
+  const dx = tx - n.x, dy = ty - n.y;
+  if (dx === 0 && dy === 0) return { x: n.x, y: n.y };
+  const hw = n.w / 2, hh = n.h / 2;
+  const s = 1 / Math.max(Math.abs(dx) / hw, Math.abs(dy) / hh);
+  return { x: n.x + dx * s, y: n.y + dy * s };
+}
 
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "callgraph/1.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            content = resp.read().decode("utf-8")
-        cache_file.write_text(content, encoding="utf-8")
-        return content
-    except Exception as e:
-        print(f"  [warn] Could not download {name}: {e}")
-        return None
+class GraphView {
+  constructor(container, opts) {
+    this.c = container;
+    this.o = opts || {};
+    this.N = new Map();      // id -> node obj
+    this.E = new Map();      // id -> edge obj
+    this.outE = new Map();   // id -> [edgeId]
+    this.inE = new Map();    // id -> [edgeId]
+    this.t = { x: 0, y: 0, k: 1 };
+    this.minZoom = 0.02;
+    this.maxZoom = 8;
+    this._id = ++GV_SEQ;
+    this._build();
+  }
 
+  _build() {
+    const svg = svgEl('svg', { class: 'gv-svg' });
+    this.svg = svg;
+    const defs = svgEl('defs');
+    const mk = svgEl('marker', {
+      id: 'arr' + this._id, viewBox: '0 0 10 10', refX: 9, refY: 5,
+      markerWidth: 7, markerHeight: 7, orient: 'auto-start-reverse',
+    });
+    // context-stroke makes the arrowhead follow each edge's stroke colour, so
+    // one marker serves every edge state (default / highlighted / flow-*).
+    mk.appendChild(svgEl('path', { d: 'M0,0 L10,5 L0,10 z', fill: 'context-stroke' }));
+    defs.appendChild(mk);
+    svg.appendChild(defs);
 
-def get_js_bundle() -> tuple[str, bool]:
-    """
-    Returns (js_bundle_html, is_inline).
-    Tries to inline all libraries; falls back to CDN <script> tags.
-    """
-    parts: list[str] = []
-    all_ok = True
+    this.vp = svgEl('g');
+    svg.appendChild(this.vp);
+    this.eLayer = svgEl('g', { class: 'edges' });
+    this.nLayer = svgEl('g', { class: 'nodes' });
+    this.vp.appendChild(this.eLayer);
+    this.vp.appendChild(this.nLayer);
 
-    for name, url in LIBS.items():
-        content = _fetch_lib(name, url)
-        if content:
-            parts.append(f"/* {name} */\n{content}")
-        else:
-            all_ok = False
+    this.c.innerHTML = '';
+    this.c.appendChild(svg);
 
-    if all_ok and parts:
-        bundle = "\n\n".join(parts)
-        return f"<script>\n{bundle}\n</script>", True
-    else:
-        # Fall back to CDN tags
-        tags = "\n".join(f'<script src="{url}"></script>' for url in LIBS.values())
-        return tags, False
+    (this.o.nodes || []).forEach((it) => this._addNode(it));
+    (this.o.edges || []).forEach((it) => this._addEdge(it));
+    this._wire();
+    this._applyT();
+  }
+
+  _addNode(it) {
+    const data = it.data || it;
+    const cls = this.o.nodeClasses ? this.o.nodeClasses(data) : (it.classes || '');
+    const label = this.o.labelOf
+      ? this.o.labelOf(data)
+      : (data.label != null ? data.label : (data.name || ''));
+    const shape = this.o.shapeOf ? this.o.shapeOf(data) : shapeFromClasses(cls);
+    const fill = this.o.fillOf ? this.o.fillOf(data) : null;
+
+    const g = svgEl('g', { class: 'node ' + cls });
+    g.__gid = data.id;
+    this.nLayer.appendChild(g);
+
+    const hasText = String(label) !== '' && shape !== 'ellipse';
+    let tw = 0, th = 0;
+    if (hasText) {
+      const txt = svgEl('text', { class: 'nlabel', 'text-anchor': 'middle', 'dominant-baseline': 'central' });
+      const lines = String(label).split('\n');
+      const lh = 12;
+      lines.forEach((ln, i) => {
+        const ts = svgEl('tspan', { x: 0 });
+        ts.setAttribute('dy', i === 0 ? -(lines.length - 1) * lh / 2 : lh);
+        ts.textContent = ln;
+        txt.appendChild(ts);
+      });
+      g.appendChild(txt);
+      const bb = txt.getBBox();
+      tw = bb.width; th = bb.height;
+    }
+
+    const sz = sizeForShape(shape, tw, th);
+    const shp = shapeEl(shape, sz.w, sz.h);
+    if (fill) shp.style.fill = fill;
+    g.insertBefore(shp, g.firstChild);
+
+    this.N.set(data.id, { data, g, shp, w: sz.w, h: sz.h, x: 0, y: 0, hidden: false, cls });
+    this.outE.set(data.id, []);
+    this.inE.set(data.id, []);
+  }
+
+  _addEdge(it) {
+    const data = it.data || it;
+    const cls = this.o.edgeClasses ? this.o.edgeClasses(data) : (it.classes || '');
+    const label = this.o.edgeLabelOf ? this.o.edgeLabelOf(data) : (data.label || '');
+
+    const path = svgEl('path', { class: 'edge ' + cls });
+    path.setAttribute('marker-end', 'url(#arr' + this._id + ')');
+    this.eLayer.appendChild(path);
+
+    let lblEl = null, lblBg = null;
+    if (label) {
+      lblBg = svgEl('rect', { class: 'edge-label-bg' });
+      lblEl = svgEl('text', { class: 'edge-label ' + cls, 'text-anchor': 'middle', 'dominant-baseline': 'central' });
+      lblEl.textContent = label;
+      this.eLayer.appendChild(lblBg);
+      this.eLayer.appendChild(lblEl);
+    }
+
+    this.E.set(data.id, { data, path, lblEl, lblBg, cls, hidden: false });
+    if (this.outE.has(data.source)) this.outE.get(data.source).push(data.id);
+    if (this.inE.has(data.target)) this.inE.get(data.target).push(data.id);
+  }
+
+  // ---- transform / interaction ------------------------------------------
+  _applyT() {
+    this.vp.setAttribute('transform', `translate(${this.t.x},${this.t.y}) scale(${this.t.k})`);
+  }
+
+  _wire() {
+    const svg = this.svg;
+    let mode = null, last = null, dragNode = null, moved = 0, downId = null;
+    const toLocal = (e) => {
+      const r = svg.getBoundingClientRect();
+      return { x: e.clientX - r.left, y: e.clientY - r.top };
+    };
+    svg.addEventListener('pointerdown', (e) => {
+      const ng = e.target.closest ? e.target.closest('.node') : null;
+      last = toLocal(e); moved = 0;
+      if (ng) { downId = ng.__gid; dragNode = this.N.get(downId); mode = 'node'; }
+      else { mode = 'pan'; downId = null; }
+      try { svg.setPointerCapture(e.pointerId); } catch (err) {}
+    });
+    svg.addEventListener('pointermove', (e) => {
+      if (!mode) return;
+      const p = toLocal(e);
+      const dx = p.x - last.x, dy = p.y - last.y;
+      moved += Math.abs(dx) + Math.abs(dy);
+      last = p;
+      if (mode === 'pan') { this.t.x += dx; this.t.y += dy; this._applyT(); }
+      else if (mode === 'node' && dragNode) {
+        dragNode.x += dx / this.t.k; dragNode.y += dy / this.t.k;
+        dragNode.g.setAttribute('transform', `translate(${dragNode.x},${dragNode.y})`);
+        this._redrawIncident(downId);
+      }
+    });
+    const up = () => {
+      if (!mode) return;
+      if (moved < 4) {
+        if (downId) {
+          this.selectOnly(downId);
+          if (this.o.onNodeTap) this.o.onNodeTap(this.N.get(downId).data);
+        } else {
+          this.unselectAll();
+          if (this.o.onBgTap) this.o.onBgTap();
+        }
+      }
+      mode = null; dragNode = null; downId = null;
+    };
+    svg.addEventListener('pointerup', up);
+    svg.addEventListener('pointercancel', up);
+    svg.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const p = toLocal(e);
+      const f = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+      const nk = Math.max(this.minZoom, Math.min(this.maxZoom, this.t.k * f));
+      this.t.x = p.x - (p.x - this.t.x) / this.t.k * nk;
+      this.t.y = p.y - (p.y - this.t.y) / this.t.k * nk;
+      this.t.k = nk;
+      this._applyT();
+    }, { passive: false });
+  }
+
+  // ---- drawing ----------------------------------------------------------
+  _positionNodes() {
+    this.N.forEach((n) => {
+      n.g.style.display = n.hidden ? 'none' : '';
+      if (!n.hidden) n.g.setAttribute('transform', `translate(${n.x},${n.y})`);
+    });
+  }
+
+  _redrawEdge(eo) {
+    const s = this.N.get(eo.data.source), t = this.N.get(eo.data.target);
+    const hide = !s || !t || s.hidden || t.hidden || eo.hidden;
+    if (hide) {
+      eo.path.style.display = 'none';
+      if (eo.lblEl) { eo.lblEl.style.display = 'none'; eo.lblBg.style.display = 'none'; }
+      return;
+    }
+    eo.path.style.display = '';
+    let d, mid;
+    if (s === t) {
+      const hw = s.w / 2, hh = s.h / 2, x = s.x, y = s.y;
+      d = `M ${x + hw * 0.4} ${y - hh} C ${x + hw + 50} ${y - hh - 40} ${x + hw + 50} ${y + hh + 40} ${x + hw * 0.4} ${y + hh}`;
+      mid = { x: x + hw + 40, y: y };
+    } else {
+      const p0 = borderPt(s, t.x, t.y), p1 = borderPt(t, s.x, s.y);
+      if (eo.cls.indexOf('loopback') >= 0) {
+        const mx = (p0.x + p1.x) / 2, my = (p0.y + p1.y) / 2;
+        const dx = p1.x - p0.x, dy = p1.y - p0.y;
+        const len = Math.hypot(dx, dy) || 1;
+        const nx = -dy / len, ny = dx / len;
+        const off = Math.min(80, len * 0.4) + 30;
+        const cx = mx + nx * off, cy = my + ny * off;
+        d = `M ${p0.x} ${p0.y} Q ${cx} ${cy} ${p1.x} ${p1.y}`;
+        mid = { x: 0.25 * p0.x + 0.5 * cx + 0.25 * p1.x, y: 0.25 * p0.y + 0.5 * cy + 0.25 * p1.y };
+      } else {
+        d = `M ${p0.x} ${p0.y} L ${p1.x} ${p1.y}`;
+        mid = { x: (p0.x + p1.x) / 2, y: (p0.y + p1.y) / 2 };
+      }
+    }
+    eo.path.setAttribute('d', d);
+    if (eo.lblEl) {
+      eo.lblEl.style.display = ''; eo.lblBg.style.display = '';
+      eo.lblEl.setAttribute('x', mid.x); eo.lblEl.setAttribute('y', mid.y);
+      const bb = eo.lblEl.getBBox();
+      eo.lblBg.setAttribute('x', bb.x - 2); eo.lblBg.setAttribute('y', bb.y - 1);
+      eo.lblBg.setAttribute('width', bb.width + 4); eo.lblBg.setAttribute('height', bb.height + 2);
+    }
+  }
+
+  _redrawIncident(id) {
+    const ids = (this.outE.get(id) || []).concat(this.inE.get(id) || []);
+    ids.forEach((eid) => this._redrawEdge(this.E.get(eid)));
+  }
+
+  _redraw() {
+    this._positionNodes();
+    this.E.forEach((e) => this._redrawEdge(e));
+  }
+
+  // ---- layouts ----------------------------------------------------------
+  layout(name, opts) {
+    opts = opts || {};
+    if (name === 'dagre') this._dagre(opts.rankDir || 'TB', opts.nodeSep || 34, opts.rankSep || 90);
+    else if (name === 'cose') this._cose();
+    else if (name === 'concentric') this._concentric();
+    this._redraw();
+    this.fit(40);
+  }
+
+  _dagre(rankDir, nodeSep, rankSep) {
+    const all = [...this.N.keys()].filter((i) => !this.N.get(i).hidden);
+    if (!all.length) return;
+    const idset = new Set(all);
+    const E = [];
+    this.E.forEach((e) => {
+      if (e.hidden) return;
+      const s = e.data.source, t = e.data.target;
+      if (s !== t && idset.has(s) && idset.has(t)) E.push([s, t]);
+    });
+
+    // 1. Break cycles: iterative DFS, mark edges pointing back to an ancestor.
+    const adj = new Map(all.map((i) => [i, []]));
+    E.forEach(([s, t]) => adj.get(s).push(t));
+    const SEP = ' ';
+    const state = new Map();   // 1 = on stack, 2 = done
+    const reversed = new Set();
+    for (const root of all) {
+      if (state.get(root)) continue;
+      const stack = [[root, 0]];
+      state.set(root, 1);
+      while (stack.length) {
+        const fr = stack[stack.length - 1];
+        const nbrs = adj.get(fr[0]);
+        if (fr[1] < nbrs.length) {
+          const v = nbrs[fr[1]++];
+          const st = state.get(v) || 0;
+          if (st === 1) reversed.add(fr[0] + SEP + v);
+          else if (st === 0) { state.set(v, 1); stack.push([v, 0]); }
+        } else { state.set(fr[0], 2); stack.pop(); }
+      }
+    }
+    const AE = E.map(([s, t]) => (reversed.has(s + SEP + t) ? [t, s] : [s, t]));
+
+    // 2. Longest-path ranking on the now-acyclic edge set.
+    const indeg = new Map(all.map((i) => [i, 0]));
+    const out = new Map(all.map((i) => [i, []]));
+    AE.forEach(([s, t]) => { out.get(s).push(t); indeg.set(t, indeg.get(t) + 1); });
+    const rank = new Map(all.map((i) => [i, 0]));
+    const q = all.filter((i) => indeg.get(i) === 0);
+    let qi = 0;
+    while (qi < q.length) {
+      const u = q[qi++];
+      for (const v of out.get(u)) {
+        if (rank.get(v) < rank.get(u) + 1) rank.set(v, rank.get(u) + 1);
+        indeg.set(v, indeg.get(v) - 1);
+        if (indeg.get(v) === 0) q.push(v);
+      }
+    }
+
+    const maxRank = Math.max(0, ...all.map((i) => rank.get(i)));
+    const layers = Array.from({ length: maxRank + 1 }, () => []);
+    all.forEach((i) => layers[rank.get(i)].push(i));
+
+    // 3. Reduce crossings: barycenter sweeps.
+    const nbrUp = new Map(all.map((i) => [i, []]));
+    const nbrDown = new Map(all.map((i) => [i, []]));
+    AE.forEach(([s, t]) => { nbrDown.get(s).push(t); nbrUp.get(t).push(s); });
+    const pos = new Map();
+    layers.forEach((L) => L.forEach((id, i) => pos.set(id, i)));
+    const bc = (id, m) => {
+      const ns = m.get(id);
+      if (!ns.length) return pos.get(id);
+      let s = 0; ns.forEach((x) => (s += pos.get(x)));
+      return s / ns.length;
+    };
+    for (let it = 0; it < 6; it++) {
+      if (it % 2 === 0) {
+        for (let r = 1; r < layers.length; r++) {
+          layers[r].sort((a, b) => bc(a, nbrUp) - bc(b, nbrUp));
+          layers[r].forEach((id, i) => pos.set(id, i));
+        }
+      } else {
+        for (let r = layers.length - 2; r >= 0; r--) {
+          layers[r].sort((a, b) => bc(a, nbrDown) - bc(b, nbrDown));
+          layers[r].forEach((id, i) => pos.set(id, i));
+        }
+      }
+    }
+
+    // 4. Coordinate assignment. rankDir maps rank->main axis, order->cross axis.
+    const horizontal = rankDir === 'LR';
+    const mainC = []; let acc = 0;
+    for (let r = 0; r < layers.length; r++) {
+      let mx = 0;
+      layers[r].forEach((id) => { const n = this.N.get(id); mx = Math.max(mx, horizontal ? n.w : n.h); });
+      mainC[r] = acc + mx / 2;
+      acc += mx + rankSep;
+    }
+    const cross = new Map();
+    layers.forEach((L) => {
+      let c = 0;
+      L.forEach((id, i) => {
+        const n = this.N.get(id);
+        const cs = horizontal ? n.h : n.w;
+        if (i > 0) c += nodeSep;
+        c += cs / 2; cross.set(id, c); c += cs / 2;
+      });
+      const shift = -c / 2;
+      L.forEach((id) => cross.set(id, cross.get(id) + shift));
+    });
+
+    // Light centering refinement: pull each node toward neighbour barycenter,
+    // then push apart to remove overlaps. Improves straightness of long paths.
+    const sizeCross = (id) => { const n = this.N.get(id); return horizontal ? n.h : n.w; };
+    for (let it = 0; it < 4; it++) {
+      const m = it % 2 === 0 ? nbrUp : nbrDown;
+      const order = it % 2 === 0 ? layers : [...layers].reverse();
+      for (const L of order) {
+        if (!L.length) continue;
+        for (let i = 0; i < L.length; i++) {
+          const ns = m.get(L[i]);
+          if (ns.length) { let s = 0; ns.forEach((x) => (s += cross.get(x))); cross.set(L[i], s / ns.length); }
+        }
+        const sortedL = [...L].sort((a, b) => cross.get(a) - cross.get(b));
+        for (let i = 1; i < sortedL.length; i++) {
+          const p = sortedL[i - 1], c2 = sortedL[i];
+          const gap = (sizeCross(p) + sizeCross(c2)) / 2 + nodeSep;
+          if (cross.get(c2) - cross.get(p) < gap) cross.set(c2, cross.get(p) + gap);
+        }
+      }
+    }
+
+    all.forEach((id) => {
+      const n = this.N.get(id);
+      if (horizontal) { n.x = mainC[rank.get(id)]; n.y = cross.get(id); }
+      else { n.x = cross.get(id); n.y = mainC[rank.get(id)]; }
+    });
+  }
+
+  _cose() {
+    const ids = [...this.N.keys()].filter((i) => !this.N.get(i).hidden);
+    const n = ids.length;
+    if (!n) return;
+    const R = Math.max(200, n * 28);
+    const pos = new Map();
+    ids.forEach((id, i) => { const a = 2 * Math.PI * i / n; pos.set(id, { x: Math.cos(a) * R, y: Math.sin(a) * R }); });
+    const edges = [];
+    this.E.forEach((e) => {
+      if (e.hidden) return;
+      const s = e.data.source, t = e.data.target;
+      if (s !== t && pos.has(s) && pos.has(t)) edges.push([s, t]);
+    });
+    const k = 120, area = k * k;
+    let temp = R;
+    const iters = n > 400 ? 150 : 280;
+    for (let it = 0; it < iters; it++) {
+      const disp = new Map(ids.map((i) => [i, { x: 0, y: 0 }]));
+      for (let a = 0; a < n; a++) {
+        for (let b = a + 1; b < n; b++) {
+          const pa = pos.get(ids[a]), pb = pos.get(ids[b]);
+          const dx = pa.x - pb.x, dy = pa.y - pb.y;
+          const dist = Math.hypot(dx, dy) || 0.01;
+          const rep = area / dist;
+          const ux = dx / dist, uy = dy / dist;
+          const da = disp.get(ids[a]), db = disp.get(ids[b]);
+          da.x += ux * rep; da.y += uy * rep; db.x -= ux * rep; db.y -= uy * rep;
+        }
+      }
+      edges.forEach(([s, t]) => {
+        const ps = pos.get(s), pt = pos.get(t);
+        const dx = ps.x - pt.x, dy = ps.y - pt.y;
+        const dist = Math.hypot(dx, dy) || 0.01;
+        const att = dist * dist / k;
+        const ux = dx / dist, uy = dy / dist;
+        const ds = disp.get(s), dt = disp.get(t);
+        ds.x -= ux * att; ds.y -= uy * att; dt.x += ux * att; dt.y += uy * att;
+      });
+      ids.forEach((id) => {
+        const d = disp.get(id);
+        const dl = Math.hypot(d.x, d.y) || 0.01;
+        const p = pos.get(id);
+        p.x += d.x / dl * Math.min(dl, temp);
+        p.y += d.y / dl * Math.min(dl, temp);
+      });
+      temp *= 0.97;
+    }
+    ids.forEach((id) => { const p = pos.get(id), nn = this.N.get(id); nn.x = p.x; nn.y = p.y; });
+  }
+
+  _concentric() {
+    const ids = [...this.N.keys()].filter((i) => !this.N.get(i).hidden);
+    if (!ids.length) return;
+    const deg = new Map(ids.map((i) => [i, 0]));
+    this.E.forEach((e) => {
+      if (e.hidden) return;
+      if (deg.has(e.data.source)) deg.set(e.data.source, deg.get(e.data.source) + 1);
+      if (deg.has(e.data.target)) deg.set(e.data.target, deg.get(e.data.target) + 1);
+    });
+    const sorted = [...ids].sort((a, b) => deg.get(b) - deg.get(a));
+    const maxd = deg.get(sorted[0]) || 0;
+    const levels = {};
+    sorted.forEach((id) => {
+      const l = Math.floor((maxd - deg.get(id)) / 2);  // levelWidth ~ 2
+      (levels[l] = levels[l] || []).push(id);
+    });
+    const lvKeys = Object.keys(levels).map(Number).sort((a, b) => a - b);
+    lvKeys.forEach((l, li) => {
+      const arr = levels[l];
+      const cnt = arr.length;
+      const r = li === 0 && cnt === 1 ? 0 : (li === 0 ? 120 : li * 170);
+      arr.forEach((id, i) => {
+        const a = 2 * Math.PI * i / Math.max(1, cnt) - Math.PI / 2;
+        const nn = this.N.get(id);
+        nn.x = r === 0 ? 0 : Math.cos(a) * r;
+        nn.y = r === 0 ? 0 : Math.sin(a) * r;
+      });
+    });
+  }
+
+  // ---- viewport helpers -------------------------------------------------
+  _fitBox(nodes, pad) {
+    if (!nodes.length) return;
+    pad = pad == null ? 40 : pad;
+    let minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+    nodes.forEach((n) => {
+      minX = Math.min(minX, n.x - n.w / 2); maxX = Math.max(maxX, n.x + n.w / 2);
+      minY = Math.min(minY, n.y - n.h / 2); maxY = Math.max(maxY, n.y + n.h / 2);
+    });
+    const cw = this.c.clientWidth || 800, ch = this.c.clientHeight || 600;
+    const w = Math.max(1, maxX - minX), h = Math.max(1, maxY - minY);
+    let k = Math.min((cw - 2 * pad) / w, (ch - 2 * pad) / h);
+    k = Math.max(this.minZoom, Math.min(this.maxZoom, k));
+    this.t.k = k;
+    this.t.x = cw / 2 - (minX + maxX) / 2 * k;
+    this.t.y = ch / 2 - (minY + maxY) / 2 * k;
+    this._applyT();
+  }
+
+  fit(pad) {
+    this._fitBox([...this.N.values()].filter((n) => !n.hidden), pad);
+  }
+
+  center(ids, pad) {
+    this._fitBox(ids.map((i) => this.N.get(i)).filter((n) => n && !n.hidden), pad);
+  }
+
+  zoomBy(f) {
+    const cx = (this.c.clientWidth || 800) / 2, cy = (this.c.clientHeight || 600) / 2;
+    const nk = Math.max(this.minZoom, Math.min(this.maxZoom, this.t.k * f));
+    this.t.x = cx - (cx - this.t.x) / this.t.k * nk;
+    this.t.y = cy - (cy - this.t.y) / this.t.k * nk;
+    this.t.k = nk;
+    this._applyT();
+  }
+
+  // ---- selection / classes / visibility ---------------------------------
+  selectOnly(id) { this.unselectAll(); const n = this.N.get(id); if (n) n.g.classList.add('selected'); }
+  unselectAll() { this.N.forEach((n) => n.g.classList.remove('selected')); }
+  nodeClass(id, cls, on) { const n = this.N.get(id); if (n) n.g.classList.toggle(cls, !!on); }
+  edgeClass(id, cls, on) {
+    const e = this.E.get(id);
+    if (!e) return;
+    e.path.classList.toggle(cls, !!on);
+    if (e.lblEl) e.lblEl.classList.toggle(cls, !!on);
+  }
+  forEachNode(cb) { this.N.forEach((n, id) => cb(id, n.data)); }
+  forEachEdge(cb) { this.E.forEach((e, id) => cb(id, e.data)); }
+  showNode(id, on) { const n = this.N.get(id); if (n) n.hidden = !on; }
+  showEdge(id, on) { const e = this.E.get(id); if (e) { e.hidden = !on; this._redrawEdge(e); } }
+  data(id) { const n = this.N.get(id); return n ? n.data : null; }
+  destroy() { this.c.innerHTML = ''; }
+}
+
+// Tiny fuzzy matcher (replaces fuse.js). Returns a score, or -1 for no match.
+function fuzzyScore(needle, hay) {
+  if (!needle) return 0;
+  needle = needle.toLowerCase();
+  hay = String(hay || '').toLowerCase();
+  const idx = hay.indexOf(needle);
+  if (idx >= 0) return 100 - idx - (hay.length - needle.length) * 0.1;
+  let hi = 0, ni = 0, gaps = 0, last = -1;
+  for (; ni < needle.length && hi < hay.length; hi++) {
+    if (needle[ni] === hay[hi]) { if (last >= 0) gaps += hi - last - 1; last = hi; ni++; }
+  }
+  if (ni < needle.length) return -1;
+  return 40 - gaps * 0.5;
+}
+
+function fuzzySearch(query, items, keys, limit) {
+  const q = query.trim();
+  if (!q) return [];
+  const scored = [];
+  for (const item of items) {
+    let best = -1;
+    for (const k of keys) {
+      const v = item[k];
+      if (v == null) continue;
+      const s = fuzzyScore(q, v);
+      if (s > best) best = s;
+    }
+    if (best > -1) scored.push({ item, score: best });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit || 50);
+}
+"""
 
 
 # ---------------------------------------------------------------------------
 # HTML template
 # ---------------------------------------------------------------------------
+# Composed with str.replace (not str.format), so CSS/JS braces need no escaping.
+# Placeholders: @@TITLE@@ @@ENGINE@@ @@APP@@ @@FLOWSTYLE@@ @@FLOWSCRIPT@@ @@GRAPHDATA@@
 
 HTML_TEMPLATE = """\
 <!DOCTYPE html>
@@ -78,11 +630,11 @@ HTML_TEMPLATE = """\
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Call Graph — {title}</title>
+<title>Call Graph — @@TITLE@@</title>
 <style>
-* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+* { box-sizing: border-box; margin: 0; padding: 0; }
 
-body {{
+body {
   font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
   background: #1e1e1e;
   color: #d4d4d4;
@@ -90,10 +642,10 @@ body {{
   display: flex;
   flex-direction: column;
   overflow: hidden;
-}}
+}
 
 /* ── Toolbar ── */
-#toolbar {{
+#toolbar {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -102,24 +654,24 @@ body {{
   border-bottom: 1px solid #3c3c3c;
   flex-shrink: 0;
   flex-wrap: wrap;
-}}
+}
 
-#title {{
+#title {
   font-weight: 600;
   font-size: 13px;
   color: #ccc;
   white-space: nowrap;
   margin-right: 4px;
-}}
+}
 
-#search-wrap {{
+#search-wrap {
   position: relative;
   flex: 1;
   min-width: 180px;
   max-width: 360px;
-}}
+}
 
-#search {{
+#search {
   width: 100%;
   padding: 5px 10px 5px 30px;
   background: #3c3c3c;
@@ -128,9 +680,9 @@ body {{
   color: #d4d4d4;
   font-size: 13px;
   outline: none;
-}}
-#search:focus {{ border-color: #007acc; }}
-#search-icon {{
+}
+#search:focus { border-color: #007acc; }
+#search-icon {
   position: absolute;
   left: 8px;
   top: 50%;
@@ -138,19 +690,19 @@ body {{
   color: #888;
   font-size: 13px;
   pointer-events: none;
-}}
-#search-count {{
+}
+#search-count {
   position: absolute;
   right: 8px;
   top: 50%;
   transform: translateY(-50%);
   font-size: 11px;
   color: #888;
-}}
+}
 
-.tb-sep {{ width: 1px; height: 20px; background: #3c3c3c; }}
+.tb-sep { width: 1px; height: 20px; background: #3c3c3c; }
 
-.tb-btn {{
+.tb-btn {
   padding: 4px 10px;
   background: #3c3c3c;
   border: 1px solid #555;
@@ -159,32 +711,50 @@ body {{
   font-size: 12px;
   cursor: pointer;
   white-space: nowrap;
-}}
-.tb-btn:hover {{ background: #4a4a4a; border-color: #777; }}
-.tb-btn.active {{ background: #007acc; border-color: #007acc; color: #fff; }}
+}
+.tb-btn:hover { background: #4a4a4a; border-color: #777; }
+.tb-btn.active { background: #007acc; border-color: #007acc; color: #fff; }
 
-select.tb-btn {{
+select.tb-btn {
   padding: 4px 6px;
   min-width: 130px;
-}}
+}
 
 /* ── Main area ── */
-#main {{
+#main {
   display: flex;
   flex: 1;
   overflow: hidden;
-}}
+}
 
-#cy {{
+#cy {
   flex: 1;
   background: #1a1a2e;
   background-image:
     radial-gradient(circle, #2a2a40 1px, transparent 1px);
   background-size: 28px 28px;
-}}
+}
+
+/* ── SVG graph engine ── */
+.gv-svg { width: 100%; height: 100%; display: block; touch-action: none; }
+.node { cursor: pointer; }
+.node .shape { stroke-width: 0; }
+.node .nlabel { font-size: 11px; font-weight: 600; fill: #1e1e1e; pointer-events: none; }
+.node.external .shape { fill-opacity: 0.55; stroke: #8a8aa6; stroke-width: 1px; stroke-dasharray: 4 3; }
+.node.external .nlabel { fill: #c8c8d8; font-style: italic; font-weight: 400; }
+.node.selected .shape { stroke: #ffffff; stroke-width: 3px; stroke-opacity: 0.9; }
+.node.highlighted .shape { stroke: #ffcc00; stroke-width: 2px; }
+.node.dimmed { opacity: 0.15; }
+.edge { fill: none; stroke: #7878b8; stroke-width: 2.5px; opacity: 0.85; }
+.edge.possible { stroke: #9090b8; stroke-dasharray: 5 3; opacity: 0.5; }
+.edge.external { stroke: #7070a0; stroke-dasharray: 1 4; opacity: 0.45; stroke-width: 1.5px; }
+.edge.dimmed { opacity: 0.04; }
+.edge.highlighted, .edge.selected { stroke: #ffcc00; opacity: 1; stroke-width: 3.5px; }
+.edge-label { font-size: 9px; fill: #cfcfe6; pointer-events: none; }
+.edge-label-bg { fill: #1a1a2e; }
 
 /* ── Info panel ── */
-#panel {{
+#panel {
   width: 340px;
   min-width: 340px;
   background: #252526;
@@ -194,63 +764,63 @@ select.tb-btn {{
   transform: translateX(340px);
   transition: transform .2s ease;
   overflow: hidden;
-}}
-#panel.open {{ transform: translateX(0); }}
+}
+#panel.open { transform: translateX(0); }
 
-#panel-header {{
+#panel-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 10px 12px 8px;
   border-bottom: 1px solid #3c3c3c;
   flex-shrink: 0;
-}}
-#panel-title {{
+}
+#panel-title {
   font-size: 14px;
   font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}}
-#panel-close {{
+}
+#panel-close {
   cursor: pointer;
   color: #888;
   font-size: 16px;
   line-height: 1;
   padding: 2px 4px;
   border-radius: 3px;
-}}
-#panel-close:hover {{ color: #d4d4d4; background: #3c3c3c; }}
+}
+#panel-close:hover { color: #d4d4d4; background: #3c3c3c; }
 
-#panel-body {{
+#panel-body {
   flex: 1;
   overflow-y: auto;
   padding: 12px;
-}}
+}
 
-.info-row {{
+.info-row {
   display: flex;
   align-items: baseline;
   gap: 6px;
   margin-bottom: 6px;
   font-size: 12px;
-}}
-.info-label {{
+}
+.info-label {
   color: #888;
   min-width: 52px;
   flex-shrink: 0;
-}}
-.info-val {{ color: #d4d4d4; word-break: break-all; }}
-.lang-badge {{
+}
+.info-val { color: #d4d4d4; word-break: break-all; }
+.lang-badge {
   display: inline-block;
   padding: 1px 6px;
   border-radius: 10px;
   font-size: 11px;
   font-weight: 600;
   color: #1e1e1e;
-}}
+}
 
-.section-title {{
+.section-title {
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: .08em;
@@ -258,9 +828,9 @@ select.tb-btn {{
   margin: 12px 0 6px;
   padding-bottom: 4px;
   border-bottom: 1px solid #3c3c3c;
-}}
+}
 
-.fn-link {{
+.fn-link {
   display: block;
   font-size: 12px;
   color: #9cdcfe;
@@ -269,13 +839,13 @@ select.tb-btn {{
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}}
-.fn-link:hover {{ color: #4fc1ff; text-decoration: underline; }}
+}
+.fn-link:hover { color: #4fc1ff; text-decoration: underline; }
 
-#source-wrap {{
+#source-wrap {
   margin-top: 12px;
-}}
-#source-code {{
+}
+#source-code {
   font-family: 'Consolas', 'Courier New', monospace;
   font-size: 11px;
   background: #1e1e1e;
@@ -288,10 +858,10 @@ select.tb-btn {{
   max-height: 300px;
   overflow-y: auto;
   line-height: 1.5;
-}}
+}
 
 /* ── Status bar ── */
-#statusbar {{
+#statusbar {
   padding: 3px 12px;
   font-size: 11px;
   color: #888;
@@ -299,11 +869,11 @@ select.tb-btn {{
   flex-shrink: 0;
   display: flex;
   gap: 16px;
-}}
-#statusbar span {{ color: #fff; }}
+}
+#statusbar span { color: #fff; }
 
 /* ── Search results dropdown ── */
-#search-results {{
+#search-results {
   display: none;
   position: absolute;
   top: calc(100% + 4px);
@@ -316,27 +886,27 @@ select.tb-btn {{
   overflow-y: auto;
   z-index: 1000;
   box-shadow: 0 4px 12px rgba(0,0,0,.5);
-}}
-#search-results.visible {{ display: block; }}
-.sr-item {{
+}
+#search-results.visible { display: block; }
+.sr-item {
   padding: 6px 10px;
   font-size: 12px;
   cursor: pointer;
   display: flex;
   justify-content: space-between;
   gap: 8px;
-}}
-.sr-item:hover {{ background: #3c3c3c; }}
-.sr-name {{ color: #d4d4d4; font-weight: 500; }}
-.sr-file {{ color: #888; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+}
+.sr-item:hover { background: #3c3c3c; }
+.sr-name { color: #d4d4d4; font-weight: 500; }
+.sr-file { color: #888; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-{flow_style}
+@@FLOWSTYLE@@
 </style>
 </head>
 <body>
 
 <div id="toolbar">
-  <span id="title">📊 {title}</span>
+  <span id="title">📊 @@TITLE@@</span>
   <div class="tb-sep"></div>
 
   <div id="search-wrap">
@@ -404,170 +974,61 @@ select.tb-btn {{
   <span id="stat-selection"></span>
 </div>
 
-{js_bundle}
+<script>
+@@ENGINE@@
+</script>
 
 <script>
+@@APP@@
+</script>
+
+<script>
+@@FLOWSCRIPT@@
+</script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Main call-graph application script (built on GraphView)
+# ---------------------------------------------------------------------------
+
+APP_SCRIPT = r"""
 // ── Data ──────────────────────────────────────────────────────────────────
-const GRAPH_DATA = {graph_data};
+const GRAPH_DATA = @@GRAPHDATA@@;
 
-// ── Cytoscape init ────────────────────────────────────────────────────────
-cytoscape.use(cytoscapeDagre);
-
-const cy = cytoscape({{
-  container: document.getElementById('cy'),
-  elements: {{
-    nodes: GRAPH_DATA.nodes.map(n => ({{
-      data: n,
-      classes: n.language,
-    }})),
-    edges: GRAPH_DATA.edges.map(e => ({{
-      data: e,
-      classes: e.confidence,
-    }})),
-  }},
-  style: [
-    {{
-      selector: 'node',
-      style: {{
-        'label': 'data(name)',
-        'background-color': 'data(color)',
-        'color': '#1e1e1e',
-        'font-size': '11px',
-        'font-weight': '600',
-        'text-valign': 'center',
-        'text-halign': 'center',
-        'shape': 'round-rectangle',
-        'width': 'label',
-        'height': '28px',
-        'padding': '8px',
-        'border-width': '0px',
-        'text-max-width': '160px',
-        'text-wrap': 'ellipsis',
-      }},
-    }},
-    {{
-      selector: 'node[class_name]',
-      style: {{
-        'label': (ele) => ele.data('class_name')
-          ? `${{ele.data('class_name')}}.${{ele.data('name')}}`
-          : ele.data('name'),
-      }},
-    }},
-    {{
-      selector: 'node.external',
-      style: {{
-        'shape': 'round-tag',
-        'background-color': 'data(color)',
-        'background-opacity': 0.55,
-        'color': '#c8c8d8',
-        'font-style': 'italic',
-        'font-weight': '400',
-        'border-width': '1px',
-        'border-color': '#8a8aa6',
-        'border-style': 'dashed',
-        'height': '24px',
-      }},
-    }},
-    {{
-      selector: 'node:selected',
-      style: {{
-        'border-width': '3px',
-        'border-color': '#ffffff',
-        'border-opacity': 0.9,
-      }},
-    }},
-    {{
-      selector: 'node.dimmed',
-      style: {{
-        'opacity': 0.15,
-      }},
-    }},
-    {{
-      selector: 'node.highlighted',
-      style: {{
-        'border-width': '2px',
-        'border-color': '#ffcc00',
-        'opacity': 1,
-      }},
-    }},
-    {{
-      selector: 'edge',
-      style: {{
-        'width': 2.5,
-        'line-color': '#7878b8',
-        'target-arrow-color': '#7878b8',
-        'target-arrow-shape': 'triangle',
-        'curve-style': 'bezier',
-        'opacity': 0.85,
-        'arrow-scale': 1.1,
-      }},
-    }},
-    {{
-      selector: 'edge.possible',
-      style: {{
-        'line-style': 'dashed',
-        'line-dash-pattern': [5, 3],
-        'opacity': 0.5,
-        'line-color': '#9090b8',
-        'target-arrow-color': '#9090b8',
-      }},
-    }},
-    {{
-      selector: 'edge.external',
-      style: {{
-        'line-style': 'dotted',
-        'opacity': 0.45,
-        'line-color': '#7070a0',
-        'target-arrow-color': '#7070a0',
-        'width': 1.5,
-      }},
-    }},
-    {{
-      selector: 'edge.dimmed',
-      style: {{ 'opacity': 0.04 }},
-    }},
-    {{
-      selector: 'edge:selected, edge.highlighted',
-      style: {{
-        'line-color': '#ffcc00',
-        'target-arrow-color': '#ffcc00',
-        'opacity': 1,
-        'width': 3.5,
-      }},
-    }},
-  ],
-  minZoom: 0.02,
-  maxZoom: 8,
-  wheelSensitivity: 0.3,
-}});
+// ── Graph engine init ───────────────────────────────────────────────────────
+const gv = new GraphView(document.getElementById('cy'), {
+  nodes: GRAPH_DATA.nodes,
+  edges: GRAPH_DATA.edges,
+  nodeClasses: (n) => n.language + (n.language === 'external' ? ' external' : ''),
+  shapeOf: (n) => (n.language === 'external' ? 'round-tag' : 'round-rectangle'),
+  labelOf: (n) => (n.class_name ? n.class_name + '.' + n.name : n.name),
+  fillOf: (n) => n.color,
+  edgeClasses: (e) => e.confidence,
+  onNodeTap: (data) => showPanel(data),
+  onBgTap: () => closePanel(),
+});
 
 // ── Layout ────────────────────────────────────────────────────────────────
-function applyLayout(name) {{
-  let opts;
-  if (name === 'dagre-lr') {{
-    opts = {{ name: 'dagre', rankDir: 'LR', nodeSep: 40, edgeSep: 10, rankSep: 120, animate: true, animationDuration: 300 }};
-  }} else if (name === 'dagre-tb') {{
-    opts = {{ name: 'dagre', rankDir: 'TB', nodeSep: 40, edgeSep: 10, rankSep: 100, animate: true, animationDuration: 300 }};
-  }} else if (name === 'cose') {{
-    opts = {{ name: 'cose', animate: true, animationDuration: 500, nodeRepulsion: 8000, idealEdgeLength: 100, gravity: 0.5 }};
-  }} else if (name === 'concentric') {{
-    opts = {{ name: 'concentric', animate: true, animationDuration: 300, concentric: n => n.degree(), levelWidth: () => 2 }};
-  }}
-  cy.layout(opts).run();
-}}
-
+function applyLayout(name) {
+  if (name === 'dagre-lr') gv.layout('dagre', { rankDir: 'LR', nodeSep: 32, rankSep: 120 });
+  else if (name === 'dagre-tb') gv.layout('dagre', { rankDir: 'TB', nodeSep: 32, rankSep: 90 });
+  else if (name === 'cose') gv.layout('cose');
+  else if (name === 'concentric') gv.layout('concentric');
+}
 applyLayout('dagre-lr');
 
 // ── Callers / Callees index ───────────────────────────────────────────────
-const calleeMap = {{}};  // nodeId → [nodeId]
-const callerMap = {{}};  // nodeId → [nodeId]
-GRAPH_DATA.nodes.forEach(n => {{ calleeMap[n.id] = []; callerMap[n.id] = []; }});
-GRAPH_DATA.edges.forEach(e => {{
+const calleeMap = {};
+const callerMap = {};
+const nodeById = {};
+GRAPH_DATA.nodes.forEach((n) => { calleeMap[n.id] = []; callerMap[n.id] = []; nodeById[n.id] = n; });
+GRAPH_DATA.edges.forEach((e) => {
   if (calleeMap[e.source]) calleeMap[e.source].push(e.target);
   if (callerMap[e.target]) callerMap[e.target].push(e.source);
-}});
-const nodeById = {{}};
-GRAPH_DATA.nodes.forEach(n => {{ nodeById[n.id] = n; }});
+});
 
 // ── Info panel ────────────────────────────────────────────────────────────
 const panel = document.getElementById('panel');
@@ -576,27 +1037,35 @@ const panelMeta = document.getElementById('panel-meta');
 const sourceCode = document.getElementById('source-code');
 const calleesSection = document.getElementById('callees-section');
 const callersSection = document.getElementById('callers-section');
+let currentData = null;
 
-function showPanel(data) {{
+function updateFlowBtn() {
+  const ok = currentData && currentData.language !== 'external'
+    && Array.isArray(currentData.flow) && currentData.flow.length;
+  document.getElementById('btn-flow').style.display = ok ? 'block' : 'none';
+}
+
+function showPanel(data) {
+  currentData = data;
   panel.classList.add('open');
   panelTitle.textContent = data.qualified_name || data.name;
   panelTitle.title = data.qualified_name || data.name;
 
   const isExternal = data.language === 'external';
-  const badge = `<span class="lang-badge" style="background:${{data.color}}">${{data.language}}</span>`;
+  const badge = `<span class="lang-badge" style="background:${data.color}">${data.language}</span>`;
   const file = data.relative_file || data.file;
-  const lines = `L${{data.start_line}}–${{data.end_line}}`;
+  const lines = `L${data.start_line}–${data.end_line}`;
 
   panelMeta.innerHTML = isExternal
     ? `
-    <div class="info-row"><span class="info-label">Lang</span><span class="info-val">${{badge}}</span></div>
+    <div class="info-row"><span class="info-label">Lang</span><span class="info-val">${badge}</span></div>
     <div class="info-row"><span class="info-label">Kind</span><span class="info-val">External / stdlib / builtin (no definition in this project)</span></div>
   `
     : `
-    <div class="info-row"><span class="info-label">Lang</span><span class="info-val">${{badge}}</span></div>
-    <div class="info-row"><span class="info-label">File</span><span class="info-val" title="${{data.file}}">${{file}}</span></div>
-    <div class="info-row"><span class="info-label">Lines</span><span class="info-val">${{lines}}</span></div>
-    ${{data.class_name ? `<div class="info-row"><span class="info-label">Class</span><span class="info-val">${{data.class_name}}</span></div>` : ''}}
+    <div class="info-row"><span class="info-label">Lang</span><span class="info-val">${badge}</span></div>
+    <div class="info-row"><span class="info-label">File</span><span class="info-val" title="${data.file}">${file}</span></div>
+    <div class="info-row"><span class="info-label">Lines</span><span class="info-val">${lines}</span></div>
+    ${data.class_name ? `<div class="info-row"><span class="info-label">Class</span><span class="info-val">${data.class_name}</span></div>` : ''}
   `;
 
   // External nodes have no source; hide the source block entirely for them.
@@ -606,204 +1075,181 @@ function showPanel(data) {{
   // Callees
   const calleeIds = [...new Set(calleeMap[data.id] || [])];
   calleesSection.innerHTML = calleeIds.length
-    ? `<div class="section-title">Calls (${{calleeIds.length}})</div>` +
-      calleeIds.map(tid => {{
+    ? `<div class="section-title">Calls (${calleeIds.length})</div>` +
+      calleeIds.map((tid) => {
         const t = nodeById[tid];
-        return t ? `<span class="fn-link" data-id="${{tid}}" title="${{t.relative_file || t.file}}: ${{t.qualified_name}}">${{t.qualified_name}}</span>` : '';
-      }}).join('')
+        return t ? `<span class="fn-link" data-id="${tid}" title="${t.relative_file || t.file}: ${t.qualified_name}">${t.qualified_name}</span>` : '';
+      }).join('')
     : '';
 
   // Callers
   const callerIds = [...new Set(callerMap[data.id] || [])];
   callersSection.innerHTML = callerIds.length
-    ? `<div class="section-title">Called by (${{callerIds.length}})</div>` +
-      callerIds.map(sid => {{
+    ? `<div class="section-title">Called by (${callerIds.length})</div>` +
+      callerIds.map((sid) => {
         const s = nodeById[sid];
-        return s ? `<span class="fn-link" data-id="${{sid}}" title="${{s.relative_file || s.file}}: ${{s.qualified_name}}">${{s.qualified_name}}</span>` : '';
-      }}).join('')
+        return s ? `<span class="fn-link" data-id="${sid}" title="${s.relative_file || s.file}: ${s.qualified_name}">${s.qualified_name}</span>` : '';
+      }).join('')
     : '';
 
-  document.getElementById('stat-selection').textContent =
-    `Selected: ${{data.qualified_name}}`;
-}}
+  document.getElementById('stat-selection').textContent = `Selected: ${data.qualified_name}`;
+  updateFlowBtn();
+}
 
-function closePanel() {{
+function closePanel() {
   panel.classList.remove('open');
   document.getElementById('stat-selection').textContent = '';
-  cy.elements().unselect();
-}}
+  currentData = null;
+  updateFlowBtn();
+  gv.unselectAll();
+}
 
 document.getElementById('panel-close').addEventListener('click', closePanel);
 
-panel.addEventListener('click', e => {{
+panel.addEventListener('click', (e) => {
   const link = e.target.closest('.fn-link');
-  if (link) {{
+  if (link) {
     const id = link.dataset.id;
-    const ele = cy.$(`#${{CSS.escape(id)}}`);
-    if (ele.length) {{
-      cy.animate({{ fit: {{ eles: ele, padding: 80 }} }}, {{ duration: 300 }});
-      ele.select();
-      showPanel(ele.data());
-    }}
-  }}
-}});
-
-cy.on('tap', 'node', evt => {{
-  showPanel(evt.target.data());
-}});
-
-cy.on('tap', evt => {{
-  if (evt.target === cy) closePanel();
-}});
+    if (nodeById[id]) {
+      gv.selectOnly(id);
+      gv.center([id], 100);
+      showPanel(nodeById[id]);
+    }
+  }
+});
 
 // ── Controls ──────────────────────────────────────────────────────────────
-document.getElementById('btn-fit').addEventListener('click', () => cy.fit(undefined, 40));
-document.getElementById('btn-zoom-in').addEventListener('click', () => cy.zoom({{ level: cy.zoom() * 1.3, renderedPosition: {{ x: cy.width()/2, y: cy.height()/2 }} }}));
-document.getElementById('btn-zoom-out').addEventListener('click', () => cy.zoom({{ level: cy.zoom() / 1.3, renderedPosition: {{ x: cy.width()/2, y: cy.height()/2 }} }}));
-
-document.getElementById('layout-select').addEventListener('change', e => applyLayout(e.target.value));
+document.getElementById('btn-fit').addEventListener('click', () => gv.fit(40));
+document.getElementById('btn-zoom-in').addEventListener('click', () => gv.zoomBy(1.3));
+document.getElementById('btn-zoom-out').addEventListener('click', () => gv.zoomBy(1 / 1.3));
+document.getElementById('layout-select').addEventListener('change', (e) => applyLayout(e.target.value));
 
 let showPossible = true;
-document.getElementById('btn-possible').addEventListener('click', function() {{
+document.getElementById('btn-possible').addEventListener('click', function () {
   showPossible = !showPossible;
   this.classList.toggle('active', showPossible);
-  cy.edges('.possible').style('display', showPossible ? 'element' : 'none');
-}});
+  gv.forEachEdge((id, e) => { if (e.confidence === 'possible') gv.showEdge(id, showPossible); });
+});
 
 // Toggle external (stdlib/builtin/third-party) nodes and their edges, then
 // re-run the current layout so the graph re-flows around what's left.
 let showExternal = true;
-document.getElementById('btn-external').addEventListener('click', function() {{
+document.getElementById('btn-external').addEventListener('click', function () {
   showExternal = !showExternal;
   this.classList.toggle('active', showExternal);
-  const disp = showExternal ? 'element' : 'none';
-  cy.nodes('.external').style('display', disp);
-  cy.edges('.external').style('display', disp);
+  gv.forEachNode((id, n) => { if (n.language === 'external') gv.showNode(id, showExternal); });
+  gv.forEachEdge((id, e) => { if (e.confidence === 'external') gv.showEdge(id, showExternal); });
   applyLayout(document.getElementById('layout-select').value);
-}});
+});
 
 // ── Fuzzy search ──────────────────────────────────────────────────────────
-const searchIndex = GRAPH_DATA.nodes.map(n => n);
-const fuse = new Fuse(searchIndex, {{
-  keys: ['name', 'qualified_name', 'relative_file', 'class_name'],
-  threshold: 0.35,
-  ignoreLocation: true,
-  minMatchCharLength: 2,
-}});
-
+const SEARCH_KEYS = ['name', 'qualified_name', 'relative_file', 'class_name'];
 const searchInput = document.getElementById('search');
 const searchResults = document.getElementById('search-results');
 const searchCount = document.getElementById('search-count');
 
-searchInput.addEventListener('input', function() {{
+function clearSearchHighlight() {
+  gv.forEachNode((id) => { gv.nodeClass(id, 'dimmed', false); gv.nodeClass(id, 'highlighted', false); });
+  gv.forEachEdge((id) => gv.edgeClass(id, 'dimmed', false));
+}
+
+searchInput.addEventListener('input', function () {
   const q = this.value.trim();
-  if (!q) {{
-    cy.elements().removeClass('dimmed highlighted');
+  if (!q) {
+    clearSearchHighlight();
     searchResults.classList.remove('visible');
     searchCount.textContent = '';
     return;
-  }}
+  }
 
-  const results = fuse.search(q, {{ limit: 50 }});
-  const matchIds = new Set(results.map(r => r.item.id));
+  const results = fuzzySearch(q, GRAPH_DATA.nodes, SEARCH_KEYS, 50);
+  const matchIds = new Set(results.map((r) => r.item.id));
   searchCount.textContent = matchIds.size || '';
 
-  cy.batch(() => {{
-    cy.nodes().forEach(n => {{
-      if (matchIds.has(n.id())) {{
-        n.removeClass('dimmed').addClass('highlighted');
-      }} else {{
-        n.addClass('dimmed').removeClass('highlighted');
-      }}
-    }});
-    cy.edges().forEach(e => {{
-      const bothMatch = matchIds.has(e.source().id()) && matchIds.has(e.target().id());
-      e.toggleClass('dimmed', !bothMatch);
-    }});
-  }});
+  gv.forEachNode((id) => {
+    const on = matchIds.has(id);
+    gv.nodeClass(id, 'highlighted', on);
+    gv.nodeClass(id, 'dimmed', !on);
+  });
+  gv.forEachEdge((id, e) => {
+    const both = matchIds.has(e.source) && matchIds.has(e.target);
+    gv.edgeClass(id, 'dimmed', !both);
+  });
 
-  // Show dropdown
-  if (results.length > 0) {{
-    searchResults.innerHTML = results.slice(0, 20).map(r => {{
+  if (results.length > 0) {
+    searchResults.innerHTML = results.slice(0, 20).map((r) => {
       const n = r.item;
-      return `<div class="sr-item" data-id="${{n.id}}">
-        <span class="sr-name">${{n.qualified_name}}</span>
-        <span class="sr-file">${{n.relative_file || n.file}}</span>
+      return `<div class="sr-item" data-id="${n.id}">
+        <span class="sr-name">${n.qualified_name}</span>
+        <span class="sr-file">${n.relative_file || n.file}</span>
       </div>`;
-    }}).join('');
+    }).join('');
     searchResults.classList.add('visible');
-  }} else {{
+  } else {
     searchResults.classList.remove('visible');
-  }}
-}});
+  }
+});
 
-searchResults.addEventListener('click', e => {{
+searchResults.addEventListener('click', (e) => {
   const item = e.target.closest('.sr-item');
   if (!item) return;
   const id = item.dataset.id;
-  const ele = cy.$(`#${{CSS.escape(id)}}`);
-  if (ele.length) {{
-    cy.animate({{ fit: {{ eles: ele.neighborhood().add(ele), padding: 80 }} }}, {{ duration: 300 }});
-    ele.select();
-    showPanel(ele.data());
-  }}
+  if (nodeById[id]) {
+    const focus = [id].concat(calleeMap[id] || [], callerMap[id] || []);
+    gv.selectOnly(id);
+    gv.center(focus, 80);
+    showPanel(nodeById[id]);
+  }
   searchResults.classList.remove('visible');
   searchInput.value = '';
-  cy.elements().removeClass('dimmed highlighted');
+  clearSearchHighlight();
   searchCount.textContent = '';
-}});
+});
 
-document.addEventListener('click', e => {{
-  if (!document.getElementById('search-wrap').contains(e.target)) {{
+document.addEventListener('click', (e) => {
+  if (!document.getElementById('search-wrap').contains(e.target)) {
     searchResults.classList.remove('visible');
-  }}
-}});
+  }
+});
 
 // ── Keyboard shortcuts ────────────────────────────────────────────────────
-document.addEventListener('keydown', e => {{
-  if (e.key === 'Escape') {{
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
     closePanel();
     searchInput.value = '';
-    cy.elements().removeClass('dimmed highlighted');
+    clearSearchHighlight();
     searchCount.textContent = '';
     searchResults.classList.remove('visible');
-  }}
-  if ((e.ctrlKey || e.metaKey) && e.key === 'f') {{
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
     e.preventDefault();
     searchInput.focus();
-  }}
-  if (e.key === '0' && (e.ctrlKey || e.metaKey)) {{
+  }
+  if (e.key === '0' && (e.ctrlKey || e.metaKey)) {
     e.preventDefault();
-    cy.fit(undefined, 40);
-  }}
-}});
+    gv.fit(40);
+  }
+});
 
 // ── Status bar ────────────────────────────────────────────────────────────
 const files = new Set(
-  GRAPH_DATA.nodes.filter(n => n.language !== 'external' && n.file).map(n => n.file)
+  GRAPH_DATA.nodes.filter((n) => n.language !== 'external' && n.file).map((n) => n.file)
 );
-const defCount = GRAPH_DATA.nodes.filter(n => n.language !== 'external').length;
+const defCount = GRAPH_DATA.nodes.filter((n) => n.language !== 'external').length;
 const extCount = GRAPH_DATA.nodes.length - defCount;
 document.getElementById('stat-nodes').textContent =
-  `${{defCount}} function${{defCount !== 1 ? 's' : ''}}` +
-  (extCount ? ` + ${{extCount}} external` : '');
+  `${defCount} function${defCount !== 1 ? 's' : ''}` +
+  (extCount ? ` + ${extCount} external` : '');
 document.getElementById('stat-edges').textContent =
-  `${{GRAPH_DATA.edges.length}} edge${{GRAPH_DATA.edges.length !== 1 ? 's' : ''}}`;
+  `${GRAPH_DATA.edges.length} edge${GRAPH_DATA.edges.length !== 1 ? 's' : ''}`;
 document.getElementById('stat-files').textContent =
-  `${{files.size}} file${{files.size !== 1 ? 's' : ''}}`;
-</script>
-
-<script>
-{flow_script}
-</script>
-</body>
-</html>
+  `${files.size} file${files.size !== 1 ? 's' : ''}`;
 """
 
 
 # ---------------------------------------------------------------------------
 # Flowchart ("block scheme") view — CSS + JS injected via plain placeholders so
-# we don't have to brace-escape this code for str.format().
+# we don't have to brace-escape this code.
 # ---------------------------------------------------------------------------
 
 FLOW_STYLE = """
@@ -826,6 +1272,37 @@ FLOW_STYLE = """
   background-image: radial-gradient(circle, #2a2a40 1px, transparent 1px);
   background-size: 28px 28px;
 }
+
+/* Flowchart node shapes (fills come from semantic classes, not data.color). */
+#flow-cy .nlabel { font-family: 'Consolas', 'Courier New', monospace; font-size: 10px; font-weight: 400; fill: #1e1e1e; }
+.node.flow-process .shape   { fill: #9cdcfe; }
+.node.flow-decision .shape  { fill: #dcdcaa; }
+.node.flow-switch .shape    { fill: #dcdcaa; }
+.node.flow-loop .shape      { fill: #c586c0; }
+.node.flow-entry .shape     { fill: #4ec9b0; }
+.node.flow-entry .nlabel    { fill: #10231f; font-weight: 700; }
+.node.flow-exit .shape      { fill: #f48771; }
+.node.flow-exit .nlabel     { fill: #2a0f0a; font-weight: 700; }
+.node.flow-jump .shape      { fill: #ce9178; }
+.node.flow-return .shape    { fill: #f48771; }
+.node.flow-throw .shape     { fill: #f44747; }
+.node.flow-throw .nlabel    { fill: #ffffff; }
+.node.flow-break .shape     { fill: #d7ba7d; }
+.node.flow-continue .shape  { fill: #d7ba7d; }
+.node.flow-try .shape       { fill: #608b4e; }
+.node.flow-try .nlabel      { fill: #ffffff; }
+.node.flow-connector .shape { fill: #7878b8; }
+
+/* Flowchart edges. */
+.edge.flow-yes      { stroke: #4ec9b0; }
+.edge.flow-no       { stroke: #f48771; }
+.edge.flow-loopback { stroke: #c586c0; stroke-dasharray: 6 4; }
+.edge.flow-catch    { stroke: #f44747; stroke-dasharray: 6 4; }
+.edge.flow-jumpedge { stroke-dasharray: 6 4; }
+.edge-label.flow-yes   { fill: #7fe0cd; }
+.edge-label.flow-no    { fill: #f4a791; }
+.edge-label.flow-case  { fill: #dcdcaa; }
+.edge-label.flow-catch { fill: #f48a8a; }
 """
 
 FLOW_SCRIPT = r"""
@@ -833,11 +1310,11 @@ FLOW_SCRIPT = r"""
   const flowView  = document.getElementById('flow-view');
   const flowTitle = document.getElementById('flow-title');
   const btnFlow   = document.getElementById('btn-flow');
-  let flowCy = null;
+  let flowGv = null;
   let uid = 0;
   const nid = () => 'f' + (uid++);
 
-  // ── Convert a structured flow tree into Cytoscape elements ────────────────
+  // ── Convert a structured flow tree into engine elements ───────────────────
   // Each builder returns {entry, exits:[{id,label,cls}]}. Open exits are wired
   // to whatever statement follows, so branches merge without extra junctions.
   function buildElements(flow) {
@@ -965,71 +1442,29 @@ FLOW_SCRIPT = r"""
     };
   }
 
-  const FLOW_CY_STYLE = [
-    { selector: 'node', style: {
-        'label': 'data(label)', 'color': '#1e1e1e', 'font-size': '10px',
-        'font-family': 'Consolas, monospace', 'text-valign': 'center', 'text-halign': 'center',
-        'text-wrap': 'wrap', 'text-max-width': '200px', 'width': 'label', 'height': 'label',
-        'padding': '8px', 'background-color': '#9cdcfe', 'shape': 'round-rectangle' } },
-    { selector: '.flow-process',  style: { 'background-color': '#9cdcfe', 'shape': 'round-rectangle' } },
-    { selector: '.flow-decision', style: { 'background-color': '#dcdcaa', 'shape': 'diamond', 'text-max-width': '140px', 'padding': '14px' } },
-    { selector: '.flow-loop',     style: { 'background-color': '#c586c0', 'shape': 'hexagon', 'padding': '12px' } },
-    { selector: '.flow-entry',    style: { 'background-color': '#4ec9b0', 'shape': 'round-pentagon', 'color': '#10231f', 'font-weight': '700' } },
-    { selector: '.flow-exit',     style: { 'background-color': '#f48771', 'shape': 'round-rectangle', 'color': '#2a0f0a', 'font-weight': '700' } },
-    { selector: '.flow-jump',     style: { 'background-color': '#ce9178', 'shape': 'round-rectangle' } },
-    { selector: '.flow-return',   style: { 'background-color': '#f48771' } },
-    { selector: '.flow-throw',    style: { 'background-color': '#f44747', 'color': '#fff' } },
-    { selector: '.flow-break',    style: { 'background-color': '#d7ba7d' } },
-    { selector: '.flow-continue', style: { 'background-color': '#d7ba7d' } },
-    { selector: '.flow-try',      style: { 'background-color': '#608b4e', 'color': '#fff' } },
-    { selector: '.flow-connector',style: { 'width': '12px', 'height': '12px', 'background-color': '#7878b8', 'label': '' } },
-    { selector: 'edge', style: {
-        'width': 2, 'line-color': '#7878b8', 'target-arrow-color': '#7878b8',
-        'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'label': 'data(label)',
-        'font-size': '9px', 'color': '#cfcfe6', 'text-background-color': '#1a1a2e',
-        'text-background-opacity': 1, 'text-background-padding': '2px' } },
-    { selector: '.flow-yes', style: { 'line-color': '#4ec9b0', 'target-arrow-color': '#4ec9b0', 'color': '#7fe0cd' } },
-    { selector: '.flow-no',  style: { 'line-color': '#f48771', 'target-arrow-color': '#f48771', 'color': '#f4a791' } },
-    { selector: '.flow-loopback', style: {
-        'line-style': 'dashed', 'line-color': '#c586c0', 'target-arrow-color': '#c586c0',
-        'curve-style': 'unbundled-bezier', 'control-point-distances': [-60], 'control-point-weights': [0.5] } },
-    { selector: '.flow-case',  style: { 'color': '#dcdcaa' } },
-    { selector: '.flow-catch', style: { 'line-style': 'dashed', 'line-color': '#f44747', 'target-arrow-color': '#f44747', 'color': '#f48a8a' } },
-    { selector: '.flow-jumpedge', style: { 'line-style': 'dashed' } },
-  ];
-
   function openFlow(data) {
     if (!data || !data.flow || !data.flow.length) return;
     uid = 0;
     const els = buildElements(data.flow);
     flowTitle.textContent = (data.qualified_name || data.name) + '()';
-    flowView.classList.add('open');
-    if (flowCy) { flowCy.destroy(); flowCy = null; }
-    flowCy = cytoscape({
-      container: document.getElementById('flow-cy'),
-      elements: els, style: FLOW_CY_STYLE,
-      minZoom: 0.05, maxZoom: 4, wheelSensitivity: 0.3,
+    flowView.classList.add('open');   // make #flow-cy visible before measuring
+    if (flowGv) { flowGv.destroy(); flowGv = null; }
+    flowGv = new GraphView(document.getElementById('flow-cy'), {
+      nodes: els.nodes,
+      edges: els.edges,
+      edgeLabelOf: (e) => e.label,
     });
-    flowCy.layout({ name: 'dagre', rankDir: 'TB', nodeSep: 28, rankSep: 48, edgeSep: 12 }).run();
-    flowCy.fit(undefined, 30);
+    flowGv.layout('dagre', { rankDir: 'TB', nodeSep: 26, rankSep: 50 });
   }
   function closeFlow() { flowView.classList.remove('open'); }
 
   // ── Wiring ────────────────────────────────────────────────────────────────
-  function refreshBtn() {
-    const sel = cy.$('node:selected');
-    const ok = sel.length === 1 && sel.data('language') !== 'external'
-      && Array.isArray(sel.data('flow')) && sel.data('flow').length;
-    btnFlow.style.display = ok ? 'block' : 'none';
-  }
-  cy.on('select unselect', 'node', refreshBtn);
-  btnFlow.addEventListener('click', () => {
-    const sel = cy.$('node:selected');
-    if (sel.length) openFlow(sel.data());
-  });
+  btnFlow.addEventListener('click', () => { if (typeof currentData !== 'undefined' && currentData) openFlow(currentData); });
   document.getElementById('flow-back').addEventListener('click', closeFlow);
-  document.getElementById('flow-fit').addEventListener('click', () => { if (flowCy) flowCy.fit(undefined, 30); });
-  document.addEventListener('keydown', e => { if (e.key === 'Escape' && flowView.classList.contains('open')) { e.stopPropagation(); closeFlow(); } }, true);
+  document.getElementById('flow-fit').addEventListener('click', () => { if (flowGv) flowGv.fit(30); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && flowView.classList.contains('open')) { e.stopPropagation(); closeFlow(); }
+  }, true);
 })();
 """
 
@@ -1040,17 +1475,7 @@ FLOW_SCRIPT = r"""
 
 
 def render(graph: CallGraph, title: str) -> str:
-    """Render a CallGraph to a fully self-contained HTML string."""
-    js_bundle, is_inline = get_js_bundle()
-    if not is_inline:
-        print(
-            "\n  " + "!" * 68 + "\n"
-            "  [WARNING] Could not inline JS libraries; falling back to CDN tags.\n"
-            "  The output file is NOT self-contained and REQUIRES internet access\n"
-            "  to open. Re-run with a network connection to embed the libraries.\n"
-            "  " + "!" * 68
-        )
-
+    """Render a CallGraph to a fully self-contained, dependency-free HTML string."""
     nodes_data = [
         {
             "id": n.id,
@@ -1085,10 +1510,14 @@ def render(graph: CallGraph, title: str) -> str:
         separators=(",", ":"),
     ).replace("</", "<\\/")
 
-    return HTML_TEMPLATE.format(
-        title=html.escape(title, quote=True),
-        js_bundle=js_bundle,
-        graph_data=graph_data_json,
-        flow_style=FLOW_STYLE,
-        flow_script=FLOW_SCRIPT,
-    )
+    # Token replacement (not str.format) so embedded CSS/JS braces need no
+    # escaping. Scripts are injected first; the (escaped) graph data goes last
+    # to fill the @@GRAPHDATA@@ placeholder carried in by APP_SCRIPT.
+    out = HTML_TEMPLATE
+    out = out.replace("@@ENGINE@@", ENGINE_SCRIPT)
+    out = out.replace("@@APP@@", APP_SCRIPT)
+    out = out.replace("@@FLOWSTYLE@@", FLOW_STYLE)
+    out = out.replace("@@FLOWSCRIPT@@", FLOW_SCRIPT)
+    out = out.replace("@@TITLE@@", html.escape(title, quote=True))
+    out = out.replace("@@GRAPHDATA@@", graph_data_json)
+    return out

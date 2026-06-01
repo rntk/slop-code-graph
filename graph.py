@@ -147,7 +147,7 @@ def main():
 
     # Render HTML
     title = target.name
-    print("Rendering HTML (may download JS libraries on first run)…")
+    print("Rendering HTML…")
     html = render(graph, title)
 
     # Write output

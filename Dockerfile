@@ -16,11 +16,8 @@ COPY graph.py .
 COPY src/ src/
 RUN chown -R appuser:appuser /app
 
-# Pre-download JS libraries into the user's cache dir
+# The renderer is fully self-contained (no external JS libraries to fetch),
+# so there is nothing to pre-download — just drop to the non-root user.
 USER appuser
-RUN HOME=/home/appuser python - << 'EOF'
-from src.renderer import get_js_bundle
-get_js_bundle()
-EOF
 
 ENTRYPOINT ["python", "graph.py"]

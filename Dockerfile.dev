@@ -24,11 +24,5 @@ RUN chown -R appuser:appuser /app
 
 USER appuser
 
-# Pre-download JS libraries into the user's cache dir
-RUN HOME=/home/appuser python - << 'EOF'
-from src.renderer import get_js_bundle
-get_js_bundle()
-EOF
-
 # Default command runs the full dev check suite
 CMD ["make", "check"]
