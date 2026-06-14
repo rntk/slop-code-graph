@@ -110,13 +110,15 @@ def main():
     print(f"Analyzing: {target}")
 
     # When a single file is given, expand collection to the parent directory so
-    # the full import graph (all files reachable from the entry) is available.
-    # The treemap will start rooted at the entry file rather than showing all
-    # files in the directory.
-    entry_file: str | None = None
+    # the full import/call graph (all files reachable from the entry) is
+    # discoverable. After building the graph we prune it to only nodes
+    # reachable *from* the entry file via outgoing edges — this excludes test
+    # files (and anything else) that calls the entry file rather than being
+    # called by it.
+    entry_abs: str | None = None
     collect_from = target
     if target.is_file():
-        entry_file = target.name  # relative to parent dir = just the filename
+        entry_abs = str(target)
         collect_from = target.parent
 
     # Collect files
@@ -146,6 +148,24 @@ def main():
         include_external=not args.no_external,
     )
 
+    # Prune to reachable subgraph when a single entry file was given.
+    if entry_abs is not None:
+        outgoing: dict[str, list[str]] = {}
+        for e in graph.edges:
+            outgoing.setdefault(e.source, []).append(e.target)
+
+        reachable: set[str] = {n.id for n in graph.nodes if n.file == entry_abs}
+        frontier = list(reachable)
+        while frontier:
+            nid = frontier.pop()
+            for tid in outgoing.get(nid, []):
+                if tid not in reachable:
+                    reachable.add(tid)
+                    frontier.append(tid)
+
+        graph.nodes = [n for n in graph.nodes if n.id in reachable]
+        graph.edges = [e for e in graph.edges if e.source in reachable and e.target in reachable]
+
     definite = sum(1 for e in graph.edges if e.confidence == "definite")
     possible = sum(1 for e in graph.edges if e.confidence == "possible")
     external = sum(1 for e in graph.edges if e.confidence == "external")
@@ -158,7 +178,7 @@ def main():
     # Render HTML
     title = target.name
     print("Rendering HTML…")
-    html = render(graph, title, entry_file=entry_file)
+    html = render(graph, title)
 
     # Write output
     out = Path(args.output)
