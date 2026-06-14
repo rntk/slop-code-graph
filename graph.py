@@ -109,8 +109,18 @@ def main():
 
     print(f"Analyzing: {target}")
 
+    # When a single file is given, expand collection to the parent directory so
+    # the full import graph (all files reachable from the entry) is available.
+    # The treemap will start rooted at the entry file rather than showing all
+    # files in the directory.
+    entry_file: str | None = None
+    collect_from = target
+    if target.is_file():
+        entry_file = target.name  # relative to parent dir = just the filename
+        collect_from = target.parent
+
     # Collect files
-    files = collect_files(target)
+    files = collect_files(collect_from)
     if not files:
         sys.exit("Error: no supported source files found.")
     print(f"Found {len(files)} source file(s)")
@@ -128,7 +138,7 @@ def main():
         sys.exit("Error: no functions found. Check that the source files contain parseable code.")
 
     # Build graph
-    base_dir = str(target) if target.is_dir() else str(target.parent)
+    base_dir = str(collect_from)
     graph = build_graph(
         functions,
         base_dir,
@@ -148,7 +158,7 @@ def main():
     # Render HTML
     title = target.name
     print("Rendering HTML…")
-    html = render(graph, title)
+    html = render(graph, title, entry_file=entry_file)
 
     # Write output
     out = Path(args.output)

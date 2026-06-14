@@ -1004,6 +1004,10 @@ select.tb-btn {
 </script>
 
 <script>
+var ENTRY_FILE = @@ENTRYFILE@@;
+</script>
+
+<script>
 @@TREEMAPSCRIPT@@
 </script>
 </body>
@@ -1612,6 +1616,20 @@ TREEMAP_SCRIPT = r"""
       return node;
     }
 
+    function weigh(n) {
+      let w = n.selfWeight || 0;
+      n.children.forEach((c) => { w += weigh(c); });
+      return (n.weight = w);
+    }
+
+    // When a single entry file was specified, build the tree rooted at that
+    // file so the treemap shows only the files reachable from it.
+    if (typeof ENTRY_FILE === 'string' && ENTRY_FILE && fileMap.has(ENTRY_FILE)) {
+      const root = makeNode(fileMap.get(ENTRY_FILE));
+      weigh(root);
+      return root;
+    }
+
     // Entry-point files (nothing calls them) are roots. If everything is in a
     // cycle, fall back to using every file as a root.
     let roots = files.filter((f) => f.callsIn.size === 0);
@@ -1627,11 +1645,7 @@ TREEMAP_SCRIPT = r"""
       .replace('📊', '').trim();
     const virtual = { name: title, path: null, virtual: true, color: '#5a5a72',
                       lang: '', selfWeight: 0, children: top };
-    (function weigh(n) {
-      let w = n.selfWeight;
-      n.children.forEach((c) => { w += weigh(c); });
-      return (n.weight = w);
-    })(virtual);
+    weigh(virtual);
     return virtual;
   }
 
@@ -1859,7 +1873,7 @@ TREEMAP_SCRIPT = r"""
 # ---------------------------------------------------------------------------
 
 
-def render(graph: CallGraph, title: str) -> str:
+def render(graph: CallGraph, title: str, entry_file: str | None = None) -> str:
     """Render a CallGraph to a fully self-contained, dependency-free HTML string."""
     nodes_data = [
         {
@@ -1905,6 +1919,7 @@ def render(graph: CallGraph, title: str) -> str:
     out = out.replace("@@FLOWSCRIPT@@", FLOW_SCRIPT)
     out = out.replace("@@TREEMAPSTYLE@@", TREEMAP_STYLE)
     out = out.replace("@@TREEMAPSCRIPT@@", TREEMAP_SCRIPT)
+    out = out.replace("@@ENTRYFILE@@", json.dumps(entry_file))
     out = out.replace("@@TITLE@@", html.escape(title, quote=True))
     out = out.replace("@@GRAPHDATA@@", graph_data_json)
     return out
