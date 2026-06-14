@@ -1,6 +1,6 @@
 """Tests for graph_builder.py."""
 
-from src.graph_builder import build_graph
+from src.graph_builder import build_graph, compute_flow_metadata
 from src.parsers import FunctionInfo
 
 
@@ -152,3 +152,55 @@ def test_external_nodes_have_empty_flow():
     graph = build_graph([f1], include_external=True)
     ext = next(n for n in graph.nodes if n.language == "external")
     assert ext.flow == []
+
+
+def test_stable_key_is_line_independent():
+    fn = make_fn(id="x::foo::99", name="foo", qualified_name="foo", file="/a/b.py")
+    graph = build_graph([fn], base_dir="/a")
+    node = next(n for n in graph.nodes if n.name == "foo")
+    assert node.stable_key == "b.py::foo"
+
+
+def test_flow_metadata_entrypoint_and_depth():
+    # f1 -> f2 -> f3 ; f1 is the only root.
+    f1 = make_fn(id="f1", name="a", qualified_name="a", calls=["b"])
+    f2 = make_fn(id="f2", name="b", qualified_name="b", calls=["c"])
+    f3 = make_fn(id="f3", name="c", qualified_name="c", calls=[])
+    graph = build_graph([f1, f2, f3])
+
+    compute_flow_metadata(graph, {"f1", "f2", "f3"})
+    by_id = {n.id: n for n in graph.nodes}
+
+    assert by_id["f1"].is_entrypoint is True
+    assert by_id["f2"].is_entrypoint is False
+    assert by_id["f3"].is_entrypoint is False
+    assert by_id["f1"].depth == 0
+    assert by_id["f2"].depth == 1
+    assert by_id["f3"].depth == 2
+
+
+def test_flow_metadata_excludes_out_of_scope_callers_from_roots():
+    # caller (out of scope) -> entry -> helper. Only `entry` is seeded, so it is
+    # the entrypoint even though something calls it.
+    entry = make_fn(id="entry", name="entry", qualified_name="entry", calls=["helper"])
+    helper = make_fn(id="helper", name="helper", qualified_name="helper", calls=[])
+    caller = make_fn(id="caller", name="caller", qualified_name="caller", calls=["entry"])
+    graph = build_graph([entry, helper, caller])
+
+    # Seed is only the entry node (as graph.py would after pruning to scope).
+    compute_flow_metadata(graph, {"entry"})
+    by_id = {n.id: n for n in graph.nodes}
+
+    assert by_id["entry"].is_entrypoint is True
+    # caller is not seeded, so it is never an entrypoint even with in-degree 0.
+    assert by_id["caller"].is_entrypoint is False
+
+
+def test_flow_metadata_all_cyclic_scope_falls_back_to_all_seeds():
+    # Mutually recursive pair with no acyclic root.
+    f1 = make_fn(id="f1", name="a", qualified_name="a", calls=["b"])
+    f2 = make_fn(id="f2", name="b", qualified_name="b", calls=["a"])
+    graph = build_graph([f1, f2])
+
+    compute_flow_metadata(graph, {"f1", "f2"})
+    assert all(n.is_entrypoint for n in graph.nodes)

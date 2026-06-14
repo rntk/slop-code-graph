@@ -22,6 +22,25 @@ class GraphNode:
     color: str
     flow: list = field(default_factory=list)  # structured control-flow (flowchart)
 
+    # ── Flow-model metadata (set by compute_flow_metadata) ──────────────────
+    # A node is an *entrypoint* when it sits at the start of a flow: it belongs
+    # to the selected scope (the file/dir the user pointed at) and nothing in
+    # the pruned graph calls it. ``depth`` is the shortest call-distance from
+    # any entrypoint, so a flow can be walked breadth-first from its roots.
+    is_entrypoint: bool = False
+    depth: int = 0
+    # Line-independent identity, stable across edits to the file body. Intended
+    # as the key under which a later pass attaches LLM-generated descriptions so
+    # the annotation survives when line numbers shift. Format:
+    # "<relative_file>::<qualified_name>" (or "external::<name>").
+    stable_key: str = ""
+
+    # ── LLM enrichment slots (populated by a later, separate pass) ──────────
+    # Left empty by the deterministic graph build. A future semantic pass walks
+    # the flow and fills these in; the renderer surfaces them when present.
+    summary: str = ""  # one-line role of this function in the flow
+    description: str = ""  # longer narrative / notes
+
 
 @dataclass
 class GraphEdge:
@@ -29,6 +48,9 @@ class GraphEdge:
     source: str
     target: str
     confidence: str  # "definite" | "possible"
+    # LLM enrichment slot: a short label for what this call *means* in the flow
+    # (e.g. "validates input", "persists record"). Empty until enriched.
+    semantic_label: str = ""
 
 
 @dataclass
@@ -98,6 +120,7 @@ def build_graph(
                 language=fn.language,
                 color=LANGUAGE_COLORS.get(fn.language, DEFAULT_COLOR),
                 flow=fn.flow,
+                stable_key=f"{rel}::{fn.qualified_name}",
             )
         )
 
@@ -120,6 +143,7 @@ def build_graph(
                 source_code="",
                 language="external",
                 color=EXTERNAL_COLOR,
+                stable_key=f"external::{name}",
             )
             external_nodes[name] = node
         return node
@@ -177,6 +201,55 @@ def build_graph(
     nodes.extend(external_nodes.values())
 
     return CallGraph(nodes=nodes, edges=edges)
+
+
+def compute_flow_metadata(graph: CallGraph, seed_ids: set[str]) -> None:
+    """Mark flow entrypoints and assign each node a depth, in place.
+
+    A *flow* is a rooted, downstream (callee-ward) view of the graph. ``seed_ids``
+    are the nodes belonging to the scope the user selected (the entry file, or
+    every file under the entry directory). After the caller has pruned the graph
+    to what is reachable *from* the seed, this function determines where the
+    flows start and how far each node sits from a start:
+
+      * **entrypoint** — a seed node with no incoming edge inside the pruned
+        graph. These are the "you are here" roots a reader (or an LLM walking the
+        flow) begins from. If every seed node has an in-edge (e.g. the whole
+        scope is one big cycle) we fall back to treating all seed nodes as
+        entrypoints so the flow still has a visible start.
+      * **depth** — shortest call-distance from any entrypoint (BFS). Entrypoints
+        are depth 0. Nodes only reachable through cycles keep depth 0 if never
+        relaxed; that is acceptable for ordering hints.
+    """
+    node_ids = {n.id for n in graph.nodes}
+    seed_ids = {nid for nid in seed_ids if nid in node_ids}
+
+    outgoing: dict[str, list[str]] = {}
+    indeg: dict[str, int] = dict.fromkeys(node_ids, 0)
+    for e in graph.edges:
+        if e.source in node_ids and e.target in node_ids:
+            outgoing.setdefault(e.source, []).append(e.target)
+            indeg[e.target] += 1
+
+    entrypoints = {nid for nid in seed_ids if indeg[nid] == 0}
+    if not entrypoints and seed_ids:
+        # Whole scope is cyclic / mutually recursive — keep every seed as a root
+        # so the flow still has a start to walk from.
+        entrypoints = set(seed_ids)
+
+    # BFS from all entrypoints to assign shortest depth.
+    depth: dict[str, int] = dict.fromkeys(entrypoints, 0)
+    frontier = list(entrypoints)
+    while frontier:
+        nid = frontier.pop(0)
+        for tid in outgoing.get(nid, []):
+            if tid not in depth:
+                depth[tid] = depth[nid] + 1
+                frontier.append(tid)
+
+    for n in graph.nodes:
+        n.is_entrypoint = n.id in entrypoints
+        n.depth = depth.get(n.id, 0)
 
 
 def _relative_path(absolute: str, base_dir: str) -> str:

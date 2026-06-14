@@ -714,6 +714,19 @@ body {
 }
 .tb-btn:hover { background: #4a4a4a; border-color: #777; }
 .tb-btn.active { background: #007acc; border-color: #007acc; color: #fff; }
+#flows-wrap { position: relative; display: inline-block; }
+#flows-menu {
+  display: none; position: absolute; top: 100%; left: 0; margin-top: 4px; z-index: 50;
+  background: #252526; border: 1px solid #555; border-radius: 4px; min-width: 240px;
+  max-height: 360px; overflow-y: auto; box-shadow: 0 6px 18px rgba(0,0,0,0.5);
+}
+#flows-menu.open { display: block; }
+.flow-item { padding: 6px 10px; cursor: pointer; border-bottom: 1px solid #333; }
+.flow-item:last-child { border-bottom: none; }
+.flow-item:hover { background: #094771; }
+.flow-item .fi-name { color: #d4d4d4; font-weight: 600; font-size: 12px; }
+.flow-item .fi-file { color: #888; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.flow-item .fi-empty { color: #888; padding: 8px 10px; font-style: italic; }
 
 select.tb-btn {
   padding: 4px 6px;
@@ -742,6 +755,10 @@ select.tb-btn {
 .node .nlabel { font-size: 11px; font-weight: 600; fill: #1e1e1e; pointer-events: none; }
 .node.external .shape { fill-opacity: 0.55; stroke: #8a8aa6; stroke-width: 1px; stroke-dasharray: 4 3; }
 .node.external .nlabel { fill: #c8c8d8; font-style: italic; font-weight: 400; }
+/* Flow entrypoints (roots): functions in the selected scope that nothing in
+   the pruned graph calls — i.e. where a flow starts. */
+.node.entrypoint .shape { stroke: #4ec9b0; stroke-width: 3px; stroke-opacity: 0.95; filter: drop-shadow(0 0 4px rgba(78,201,176,0.6)); }
+.node.entrypoint .nlabel { font-weight: 700; }
 .node.selected .shape { stroke: #ffffff; stroke-width: 3px; stroke-opacity: 0.9; }
 .node.highlighted .shape { stroke: #ffcc00; stroke-width: 2px; }
 .node.dimmed { opacity: 0.15; }
@@ -941,6 +958,14 @@ select.tb-btn {
 
   <button class="tb-btn active" id="btn-possible" title="Toggle low-confidence edges" data-graph-only>Possible edges</button>
   <button class="tb-btn active" id="btn-external" title="Toggle external / stdlib / builtin calls" data-graph-only>External calls</button>
+
+  <div class="tb-sep" data-graph-only></div>
+
+  <div id="flows-wrap" data-graph-only>
+    <button class="tb-btn" id="btn-flows" title="Jump to a flow entrypoint">Flows ▾</button>
+    <div id="flows-menu"></div>
+  </div>
+  <button class="tb-btn" id="btn-reset-flow" title="Show the whole graph again" data-graph-only style="display:none">Show all</button>
 </div>
 
 <div id="main">
@@ -974,6 +999,7 @@ select.tb-btn {
     <div id="panel-body">
       <div id="panel-meta"></div>
       <button class="tb-btn" id="btn-flow" style="display:none;width:100%;margin-bottom:4px">▦ View flowchart (conditions & loops) ▸</button>
+      <button class="tb-btn" id="btn-isolate" style="display:none;width:100%;margin-bottom:4px">⇣ Isolate downstream flow ▸</button>
       <div id="source-wrap">
         <div class="section-title">Source</div>
         <pre id="source-code"></pre>
@@ -1023,7 +1049,7 @@ const GRAPH_DATA = @@GRAPHDATA@@;
 const gv = new GraphView(document.getElementById('cy'), {
   nodes: GRAPH_DATA.nodes,
   edges: GRAPH_DATA.edges,
-  nodeClasses: (n) => n.language + (n.language === 'external' ? ' external' : ''),
+  nodeClasses: (n) => n.language + (n.language === 'external' ? ' external' : '') + (n.is_entrypoint ? ' entrypoint' : ''),
   shapeOf: (n) => (n.language === 'external' ? 'round-tag' : 'round-rectangle'),
   labelOf: (n) => (n.class_name ? n.class_name + '.' + n.name : n.name),
   fillOf: (n) => n.color,
@@ -1087,6 +1113,8 @@ function showPanel(data) {
     <div class="info-row"><span class="info-label">File</span><span class="info-val" title="${data.file}">${file}</span></div>
     <div class="info-row"><span class="info-label">Lines</span><span class="info-val">${lines}</span></div>
     ${data.class_name ? `<div class="info-row"><span class="info-label">Class</span><span class="info-val">${data.class_name}</span></div>` : ''}
+    <div class="info-row"><span class="info-label">Flow</span><span class="info-val">${data.is_entrypoint ? '🟢 Entrypoint (flow root)' : 'depth ' + data.depth + ' from entrypoint'}</span></div>
+    ${data.summary ? `<div class="info-row"><span class="info-label">Summary</span><span class="info-val">${data.summary}</span></div>` : ''}
   `;
 
   // External nodes have no source; hide the source block entirely for them.
@@ -1113,9 +1141,17 @@ function showPanel(data) {
       }).join('')
     : '';
 
-  document.getElementById('stat-selection').textContent = `Selected: ${data.qualified_name}`;
+  if (!flowActive) {
+    document.getElementById('stat-selection').textContent = `Selected: ${data.qualified_name}`;
+  }
+  document.getElementById('btn-isolate').style.display =
+    (!isExternal && (calleeMap[data.id] || []).length) ? 'block' : 'none';
   updateFlowBtn();
 }
+
+document.getElementById('btn-isolate').addEventListener('click', () => {
+  if (currentData) isolateFlow(currentData.id);
+});
 
 function closePanel() {
   panel.classList.remove('open');
@@ -1161,6 +1197,77 @@ document.getElementById('btn-external').addEventListener('click', function () {
   gv.forEachNode((id, n) => { if (n.language === 'external') gv.showNode(id, showExternal); });
   gv.forEachEdge((id, e) => { if (e.confidence === 'external') gv.showEdge(id, showExternal); });
   applyLayout(document.getElementById('layout-select').value);
+});
+
+// ── Flows: entrypoints + downstream isolation ─────────────────────────────
+// A "flow" is one entrypoint and everything reachable from it via call edges.
+// Isolating a flow dims every node/edge that is not part of that downstream
+// subtree, so the user (and, later, an LLM walking the flow) sees a single
+// rooted path instead of the whole graph.
+const ENTRYPOINTS = GRAPH_DATA.nodes
+  .filter((n) => n.is_entrypoint)
+  .sort((a, b) => (a.relative_file || '').localeCompare(b.relative_file || '')
+    || (a.qualified_name || '').localeCompare(b.qualified_name || ''));
+
+function downstreamOf(rootId) {
+  // Transitive closure over callees, including the root. Cycles are handled by
+  // the visited set.
+  const seen = new Set([rootId]);
+  const stack = [rootId];
+  while (stack.length) {
+    const id = stack.pop();
+    (calleeMap[id] || []).forEach((t) => { if (!seen.has(t)) { seen.add(t); stack.push(t); } });
+  }
+  return seen;
+}
+
+let flowActive = false;
+function isolateFlow(rootId) {
+  const keep = downstreamOf(rootId);
+  gv.forEachNode((id) => {
+    gv.nodeClass(id, 'dimmed', !keep.has(id));
+    gv.nodeClass(id, 'highlighted', false);
+  });
+  gv.forEachEdge((id, e) => gv.edgeClass(id, 'dimmed', !(keep.has(e.source) && keep.has(e.target))));
+  flowActive = true;
+  document.getElementById('btn-reset-flow').style.display = '';
+  gv.center([...keep], 60);
+  const root = nodeById[rootId];
+  document.getElementById('stat-selection').textContent =
+    `Flow: ${root ? root.qualified_name : rootId} (${keep.size} function${keep.size !== 1 ? 's' : ''})`;
+}
+
+function resetFlow() {
+  gv.forEachNode((id) => { gv.nodeClass(id, 'dimmed', false); gv.nodeClass(id, 'highlighted', false); });
+  gv.forEachEdge((id) => gv.edgeClass(id, 'dimmed', false));
+  flowActive = false;
+  document.getElementById('btn-reset-flow').style.display = 'none';
+  document.getElementById('stat-selection').textContent = '';
+}
+document.getElementById('btn-reset-flow').addEventListener('click', resetFlow);
+
+// Build the Flows ▾ dropdown from detected entrypoints.
+const flowsMenu = document.getElementById('flows-menu');
+const flowsBtn = document.getElementById('btn-flows');
+flowsMenu.innerHTML = ENTRYPOINTS.length
+  ? ENTRYPOINTS.map((n) =>
+      `<div class="flow-item" data-id="${n.id}">` +
+      `<div class="fi-name">${n.qualified_name}</div>` +
+      `<div class="fi-file">${n.relative_file || n.file || ''}</div></div>`
+    ).join('')
+  : '<div class="fi-empty">No entrypoints detected</div>';
+flowsBtn.textContent = `Flows (${ENTRYPOINTS.length}) ▾`;
+
+flowsBtn.addEventListener('click', (e) => { e.stopPropagation(); flowsMenu.classList.toggle('open'); });
+flowsMenu.addEventListener('click', (e) => {
+  const item = e.target.closest('.flow-item');
+  if (!item) return;
+  const id = item.dataset.id;
+  flowsMenu.classList.remove('open');
+  if (nodeById[id]) { gv.selectOnly(id); isolateFlow(id); showPanel(nodeById[id]); }
+});
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('#flows-wrap')) flowsMenu.classList.remove('open');
 });
 
 // ── Fuzzy search ──────────────────────────────────────────────────────────
@@ -1875,6 +1982,11 @@ def render(graph: CallGraph, title: str) -> str:
             "language": n.language,
             "color": n.color,
             "flow": n.flow or [],
+            "is_entrypoint": n.is_entrypoint,
+            "depth": n.depth,
+            "stable_key": n.stable_key,
+            "summary": n.summary,
+            "description": n.description,
         }
         for n in graph.nodes
     ]
@@ -1885,6 +1997,7 @@ def render(graph: CallGraph, title: str) -> str:
             "source": e.source,
             "target": e.target,
             "confidence": e.confidence,
+            "semantic_label": e.semantic_label,
         }
         for e in graph.edges
     ]

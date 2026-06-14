@@ -13,7 +13,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from src.graph_builder import build_graph
+from src.graph_builder import build_graph, compute_flow_metadata
 from src.parsers import get_registry, parse_files
 from src.renderer import render
 
@@ -58,6 +58,41 @@ IGNORE_DIRS = {
     ".idea",
     ".vscode",
 }
+
+# Files/dirs whose presence marks a project root. We collect the whole project
+# (up to the nearest marker) so that, whatever scope the user selects, the
+# *callers* living elsewhere in the project are visible — and can therefore be
+# pruned out — giving a directory the same downstream-only flow a single file
+# already gets. Ordered by how strongly each implies a root.
+PROJECT_MARKERS = {
+    ".git",
+    ".hg",
+    ".svn",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "package.json",
+    "go.mod",
+    "Cargo.toml",
+    "pom.xml",
+    "build.gradle",
+    "composer.json",
+}
+
+
+def find_collection_root(target: Path) -> Path:
+    """Walk up from ``target`` to the nearest project root.
+
+    Collecting from here (rather than just the target's own folder) is what lets
+    a directory exclude callers that live outside it: they get parsed, found to
+    be out of scope, and pruned. Falls back to the target's own directory when no
+    project marker is found, preserving the original single-folder behaviour.
+    """
+    base = target if target.is_dir() else target.parent
+    for cand in (base, *base.parents):
+        if any((cand / m).exists() for m in PROJECT_MARKERS):
+            return cand
+    return base
 
 
 def collect_files(path: Path) -> list[Path]:
@@ -109,17 +144,12 @@ def main():
 
     print(f"Analyzing: {target}")
 
-    # When a single file is given, expand collection to the parent directory so
-    # the full import/call graph (all files reachable from the entry) is
-    # discoverable. After building the graph we prune it to only nodes
-    # reachable *from* the entry file via outgoing edges — this excludes test
-    # files (and anything else) that calls the entry file rather than being
-    # called by it.
-    entry_abs: str | None = None
-    collect_from = target
-    if target.is_file():
-        entry_abs = str(target)
-        collect_from = target.parent
+    # Collect from the project root (nearest marker walking up), not just the
+    # target's own folder. This makes the selected *scope* and the collected set
+    # independent: whatever the user points at (file or directory), callers that
+    # live elsewhere in the project are parsed so the prune below can exclude
+    # them — leaving only the downstream flow out of the scope.
+    collect_from = find_collection_root(target)
 
     # Collect files
     files = collect_files(collect_from)
@@ -148,23 +178,42 @@ def main():
         include_external=not args.no_external,
     )
 
-    # Prune to reachable subgraph when a single entry file was given.
-    if entry_abs is not None:
-        outgoing: dict[str, list[str]] = {}
-        for e in graph.edges:
-            outgoing.setdefault(e.source, []).append(e.target)
+    # ── Flow scoping ────────────────────────────────────────────────────────
+    # The *scope* is the set of files the user pointed at: the single entry file,
+    # or every collected file located under the target directory. We prune the
+    # graph to only what is reachable *from* the scope via outgoing (call) edges,
+    # dropping callers that live outside it — e.g. test files that call into the
+    # scope. What remains is the downstream flow, not the full bidirectional call
+    # graph. Because collection reaches the whole project (see find_collection_root),
+    # those outside callers were parsed and so can actually be excluded here, for a
+    # directory just as for a single file. The entrypoint detection below then
+    # reveals where each remaining flow starts.
+    scope_files = (
+        {str(target)} if target.is_file() else {str(f) for f in files if target in f.parents}
+    )
 
-        reachable: set[str] = {n.id for n in graph.nodes if n.file == entry_abs}
-        frontier = list(reachable)
-        while frontier:
-            nid = frontier.pop()
-            for tid in outgoing.get(nid, []):
-                if tid not in reachable:
-                    reachable.add(tid)
-                    frontier.append(tid)
+    seed_ids: set[str] = {n.id for n in graph.nodes if n.file in scope_files}
 
-        graph.nodes = [n for n in graph.nodes if n.id in reachable]
-        graph.edges = [e for e in graph.edges if e.source in reachable and e.target in reachable]
+    outgoing: dict[str, list[str]] = {}
+    for e in graph.edges:
+        outgoing.setdefault(e.source, []).append(e.target)
+
+    reachable: set[str] = set(seed_ids)
+    frontier = list(reachable)
+    while frontier:
+        nid = frontier.pop()
+        for tid in outgoing.get(nid, []):
+            if tid not in reachable:
+                reachable.add(tid)
+                frontier.append(tid)
+
+    graph.nodes = [n for n in graph.nodes if n.id in reachable]
+    graph.edges = [e for e in graph.edges if e.source in reachable and e.target in reachable]
+
+    # Mark entrypoints (flow roots) and per-node depth on the pruned graph.
+    compute_flow_metadata(graph, seed_ids & reachable)
+    entrypoint_count = sum(1 for n in graph.nodes if n.is_entrypoint)
+    print(f"Identified {entrypoint_count} flow entrypoint(s)")
 
     definite = sum(1 for e in graph.edges if e.confidence == "definite")
     possible = sum(1 for e in graph.edges if e.confidence == "possible")
