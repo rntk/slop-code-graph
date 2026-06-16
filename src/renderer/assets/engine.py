@@ -73,6 +73,11 @@ class GraphView {
     this.minZoom = 0.02;
     this.maxZoom = 8;
     this._id = ++GV_SEQ;
+    // File grouping: on by default when the caller supplies a groupOf accessor.
+    // _dagreGrouped fills _groupBoxes (absolute file-container rects); other
+    // layouts leave it empty so no boxes are drawn.
+    this.grouping = !!(this.o && this.o.groupOf);
+    this._groupBoxes = [];
     this._build();
   }
 
@@ -92,8 +97,12 @@ class GraphView {
 
     this.vp = svgEl('g');
     svg.appendChild(this.vp);
+    // Groups (file containers) sit behind edges and nodes so functions render
+    // on top of their file box.
+    this.gLayer = svgEl('g', { class: 'groups' });
     this.eLayer = svgEl('g', { class: 'edges' });
     this.nLayer = svgEl('g', { class: 'nodes' });
+    this.vp.appendChild(this.gLayer);
     this.vp.appendChild(this.eLayer);
     this.vp.appendChild(this.nLayer);
 
@@ -284,6 +293,34 @@ class GraphView {
   _redraw() {
     this._positionNodes();
     this.E.forEach((e) => this._redrawEdge(e));
+    this._redrawGroups();
+  }
+
+  // Render the file-container boxes computed by _dagreGrouped. Rebuilt from
+  // scratch each time so toggling grouping / re-running a flat layout simply
+  // clears them (empty _groupBoxes -> empty layer).
+  _redrawGroups() {
+    const layer = this.gLayer;
+    while (layer.firstChild) layer.removeChild(layer.firstChild);
+    (this._groupBoxes || []).forEach((b) => {
+      const g = svgEl('g', { class: 'gv-group' });
+      const rect = svgEl('rect', {
+        x: b.x, y: b.y, width: b.w, height: b.h, rx: 10, ry: 10, class: 'gv-group-box',
+      });
+      if (b.color) rect.style.stroke = b.color;
+      g.appendChild(rect);
+      const label = svgEl('text', {
+        x: b.x + 12, y: b.y + 16, class: 'gv-group-label',
+      });
+      label.textContent = b.label;
+      if (b.color) label.style.fill = b.color;
+      g.appendChild(label);
+      layer.appendChild(g);
+    });
+  }
+
+  setGrouping(on) {
+    this.grouping = !!on && !!this.o.groupOf;
   }
 
   // ---- layouts ----------------------------------------------------------
@@ -297,6 +334,14 @@ class GraphView {
   }
 
   _dagre(rankDir, nodeSep, rankSep) {
+    // File grouping (when a groupOf accessor is supplied and enabled) lays the
+    // graph out as nested boxes; see _dagreGrouped. Otherwise lay every visible
+    // node out in one flat hierarchy.
+    if (this.grouping && this.o.groupOf) {
+      this._dagreGrouped(rankDir, nodeSep, rankSep);
+      return;
+    }
+    this._groupBoxes = [];
     const all = [...this.N.keys()].filter((i) => !this.N.get(i).hidden);
     if (!all.length) return;
     const idset = new Set(all);
@@ -306,6 +351,17 @@ class GraphView {
       const s = e.data.source, t = e.data.target;
       if (s !== t && idset.has(s) && idset.has(t)) E.push([s, t]);
     });
+
+    const pos = this._layoutDagre(all, E, (id) => this.N.get(id), rankDir, nodeSep, rankSep);
+    all.forEach((id) => { const n = this.N.get(id), p = pos.get(id); n.x = p.x; n.y = p.y; });
+  }
+
+  // Pure layered (dagre-style) layout over an arbitrary node/edge set. Returns a
+  // Map id -> {x, y} of node *centres*. ``sizeOf(id)`` yields {w, h} for a node,
+  // letting the same routine lay out real nodes or synthetic file-box meta-nodes.
+  _layoutDagre(all, E, sizeOf, rankDir, nodeSep, rankSep) {
+    const result = new Map();
+    if (!all.length) return result;
 
     // 1. Break cycles: iterative DFS, mark edges pointing back to an ancestor.
     const adj = new Map(all.map((i) => [i, []]));
@@ -381,7 +437,7 @@ class GraphView {
     const mainC = []; let acc = 0;
     for (let r = 0; r < layers.length; r++) {
       let mx = 0;
-      layers[r].forEach((id) => { const n = this.N.get(id); mx = Math.max(mx, horizontal ? n.w : n.h); });
+      layers[r].forEach((id) => { const n = sizeOf(id); mx = Math.max(mx, horizontal ? n.w : n.h); });
       mainC[r] = acc + mx / 2;
       acc += mx + rankSep;
     }
@@ -389,7 +445,7 @@ class GraphView {
     layers.forEach((L) => {
       let c = 0;
       L.forEach((id, i) => {
-        const n = this.N.get(id);
+        const n = sizeOf(id);
         const cs = horizontal ? n.h : n.w;
         if (i > 0) c += nodeSep;
         c += cs / 2; cross.set(id, c); c += cs / 2;
@@ -400,7 +456,7 @@ class GraphView {
 
     // Light centering refinement: pull each node toward neighbour barycenter,
     // then push apart to remove overlaps. Improves straightness of long paths.
-    const sizeCross = (id) => { const n = this.N.get(id); return horizontal ? n.h : n.w; };
+    const sizeCross = (id) => { const n = sizeOf(id); return horizontal ? n.h : n.w; };
     for (let it = 0; it < 4; it++) {
       const m = it % 2 === 0 ? nbrUp : nbrDown;
       const order = it % 2 === 0 ? layers : [...layers].reverse();
@@ -420,13 +476,113 @@ class GraphView {
     }
 
     all.forEach((id) => {
-      const n = this.N.get(id);
-      if (horizontal) { n.x = mainC[rank.get(id)]; n.y = cross.get(id); }
-      else { n.x = cross.get(id); n.y = mainC[rank.get(id)]; }
+      if (horizontal) result.set(id, { x: mainC[rank.get(id)], y: cross.get(id) });
+      else result.set(id, { x: cross.get(id), y: mainC[rank.get(id)] });
     });
+    return result;
+  }
+
+  // Grouped (nested) hierarchical layout. Each file becomes a container box:
+  //   1. lay out each file's own nodes internally (intra-file edges only),
+  //      yielding per-file positions and a padded box size;
+  //   2. treat every file box — plus each ungrouped node (e.g. external) — as a
+  //      meta-node and lay *those* out with the same routine, using cross-file
+  //      edges; this spaces the boxes so they never overlap;
+  //   3. translate each file's internal positions into its box's final slot.
+  // Because a node's relative position is clamped within its box's padding, the
+  // function nodes are always fully contained by their file box.
+  _dagreGrouped(rankDir, nodeSep, rankSep) {
+    const PAD = 16;        // inner margin around the nodes inside a box
+    const HEADER = 26;     // extra top space for the file label
+    const all = [...this.N.keys()].filter((i) => !this.N.get(i).hidden);
+    if (!all.length) { this._groupBoxes = []; return; }
+
+    const keyOf = (id) => this.o.groupOf(this.N.get(id).data);
+    const groups = new Map();   // groupKey -> [ids]
+    const loners = [];          // ungrouped node ids (own meta-node)
+    all.forEach((id) => {
+      const k = keyOf(id);
+      if (k == null || k === '') { loners.push(id); return; }
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(id);
+    });
+
+    // All visible, non-self edges — reused for both intra- and inter-group passes.
+    const E = [];
+    const idset = new Set(all);
+    this.E.forEach((e) => {
+      if (e.hidden) return;
+      const s = e.data.source, t = e.data.target;
+      if (s !== t && idset.has(s) && idset.has(t)) E.push([s, t]);
+    });
+
+    // 1. Lay each group out internally; record per-node relative centres + box size.
+    const intra = new Map();    // id -> {x, y} relative to its box top-left
+    const metaSize = new Map(); // metaId -> {w, h}
+    const metaColor = new Map();
+    const metaLabel = new Map();
+    groups.forEach((gids, key) => {
+      const gset = new Set(gids);
+      const gE = E.filter(([s, t]) => gset.has(s) && gset.has(t));
+      const gpos = this._layoutDagre(gids, gE, (id) => this.N.get(id), rankDir, nodeSep, rankSep);
+      let minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+      gids.forEach((id) => {
+        const n = this.N.get(id), p = gpos.get(id);
+        minX = Math.min(minX, p.x - n.w / 2); maxX = Math.max(maxX, p.x + n.w / 2);
+        minY = Math.min(minY, p.y - n.h / 2); maxY = Math.max(maxY, p.y + n.h / 2);
+      });
+      gids.forEach((id) => {
+        const p = gpos.get(id);
+        intra.set(id, { x: p.x - minX + PAD, y: p.y - minY + PAD + HEADER });
+      });
+      metaSize.set(key, { w: (maxX - minX) + PAD * 2, h: (maxY - minY) + PAD * 2 + HEADER });
+      // Box accent colour follows the file's dominant language colour.
+      const first = this.N.get(gids[0]);
+      metaColor.set(key, first && first.data ? first.data.color : null);
+      metaLabel.set(key, key);
+    });
+    loners.forEach((id) => {
+      const n = this.N.get(id);
+      metaSize.set(id, { w: n.w, h: n.h });
+    });
+
+    // 2. Inter-group meta layout.
+    const metaOf = (id) => { const k = keyOf(id); return (k == null || k === '') ? id : k; };
+    const metaIds = [...groups.keys(), ...loners];
+    const metaSeen = new Set();
+    const metaE = [];
+    E.forEach(([s, t]) => {
+      const ms = metaOf(s), mt = metaOf(t);
+      if (ms === mt) return;
+      const k = ms + '##' + mt;
+      if (metaSeen.has(k)) return;
+      metaSeen.add(k);
+      metaE.push([ms, mt]);
+    });
+    const mpos = this._layoutDagre(
+      metaIds, metaE, (id) => metaSize.get(id), rankDir, nodeSep + 24, rankSep + 24,
+    );
+
+    // 3. Place real nodes; record absolute box rects for _redrawGroups.
+    const boxes = [];
+    groups.forEach((gids, key) => {
+      const c = mpos.get(key), sz = metaSize.get(key);
+      const x0 = c.x - sz.w / 2, y0 = c.y - sz.h / 2;
+      gids.forEach((id) => {
+        const rel = intra.get(id), n = this.N.get(id);
+        n.x = x0 + rel.x; n.y = y0 + rel.y;
+      });
+      boxes.push({ x: x0, y: y0, w: sz.w, h: sz.h, label: metaLabel.get(key), color: metaColor.get(key) });
+    });
+    loners.forEach((id) => {
+      const c = mpos.get(id), n = this.N.get(id);
+      n.x = c.x; n.y = c.y;
+    });
+    this._groupBoxes = boxes;
   }
 
   _cose() {
+    this._groupBoxes = [];
     const ids = [...this.N.keys()].filter((i) => !this.N.get(i).hidden);
     const n = ids.length;
     if (!n) return;
@@ -477,6 +633,7 @@ class GraphView {
   }
 
   _concentric() {
+    this._groupBoxes = [];
     const ids = [...this.N.keys()].filter((i) => !this.N.get(i).hidden);
     if (!ids.length) return;
     const deg = new Map(ids.map((i) => [i, 0]));

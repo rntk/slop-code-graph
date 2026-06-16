@@ -133,6 +133,22 @@ select.tb-btn {
 
 /* ── SVG graph engine ── */
 .gv-svg { width: 100%; height: 100%; display: block; touch-action: none; }
+/* File containers: a translucent box drawn behind the function nodes that
+   belong to one source file, with the file path as a header label. */
+.gv-group-box {
+  fill: rgba(255, 255, 255, 0.025);
+  stroke: #565676;
+  stroke-width: 1.5px;
+  stroke-opacity: 0.7;
+}
+.gv-group-label {
+  font-size: 12px;
+  font-weight: 600;
+  fill: #9aa0c0;
+  pointer-events: none;
+  dominant-baseline: middle;
+  opacity: 0.9;
+}
 .node { cursor: pointer; }
 .node .shape { stroke-width: 0; }
 .node .nlabel { font-size: 11px; font-weight: 600; fill: #1e1e1e; pointer-events: none; }
@@ -341,6 +357,7 @@ select.tb-btn {
 
   <button class="tb-btn active" id="btn-possible" title="Toggle low-confidence edges" data-graph-only>Possible edges</button>
   <button class="tb-btn active" id="btn-external" title="Toggle external / stdlib / builtin calls" data-graph-only>External calls</button>
+  <button class="tb-btn active" id="btn-group" title="Group functions into file containers (hierarchical layouts only)" data-graph-only>Group by file</button>
 
   <div class="tb-sep" data-graph-only></div>
 

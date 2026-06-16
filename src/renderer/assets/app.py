@@ -13,6 +13,10 @@ const gv = new GraphView(document.getElementById('cy'), {
   edges: GRAPH_DATA.edges,
   nodeClasses: (n) => n.language + (n.language === 'external' ? ' external' : '') + (n.is_entrypoint ? ' entrypoint' : ''),
   shapeOf: (n) => (n.language === 'external' ? 'round-tag' : 'round-rectangle'),
+  // Group function nodes into file containers in the hierarchical layout.
+  // External (stdlib/builtin) nodes are deduped across files, so they belong to
+  // no single file and stay ungrouped (null).
+  groupOf: (n) => (n.language === 'external' ? null : (n.relative_file || n.file || null)),
   labelOf: (n) => (n.class_name ? n.class_name + '.' + n.name : n.name),
   fillOf: (n) => n.color,
   edgeClasses: (e) => e.confidence,
@@ -158,6 +162,16 @@ document.getElementById('btn-external').addEventListener('click', function () {
   this.classList.toggle('active', showExternal);
   gv.forEachNode((id, n) => { if (n.language === 'external') gv.showNode(id, showExternal); });
   gv.forEachEdge((id, e) => { if (e.confidence === 'external') gv.showEdge(id, showExternal); });
+  applyLayout(document.getElementById('layout-select').value);
+});
+
+// Toggle file-container grouping, then re-run the current layout. Boxes only
+// appear in the hierarchical (dagre) layouts; cose/concentric ignore grouping.
+let groupByFile = true;
+document.getElementById('btn-group').addEventListener('click', function () {
+  groupByFile = !groupByFile;
+  this.classList.toggle('active', groupByFile);
+  gv.setGrouping(groupByFile);
   applyLayout(document.getElementById('layout-select').value);
 });
 
