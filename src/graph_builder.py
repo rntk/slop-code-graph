@@ -59,6 +59,28 @@ class CallGraph:
     edges: list[GraphEdge] = field(default_factory=list)
 
 
+def _disambiguate(caller: FunctionInfo, candidates: list[FunctionInfo]) -> list[FunctionInfo]:
+    """Narrow an ambiguous call to its most likely real target(s).
+
+    A call name is matched against every definition with that name across the
+    whole collected project. Without narrowing, an unqualified call resolves to
+    *all* of them — so a function calling a locally-defined ``validate`` also
+    gets a spurious edge to an unrelated ``validate`` in another file. When the
+    caller's own file defines the called name, lexical scope makes that local
+    definition the real target, so we restrict to it; same-named functions
+    elsewhere are unrelated. No-op unless it leaves at least one candidate, so a
+    purely cross-file call is never lost.
+    """
+    if len(candidates) <= 1:
+        return candidates
+
+    same_file = [c for c in candidates if c.file == caller.file]
+    if same_file:
+        return same_file
+
+    return candidates
+
+
 LANGUAGE_COLORS = {
     "python": "#4ec9b0",
     "javascript": "#dcdcaa",
@@ -171,6 +193,16 @@ def build_graph(
 
     for fn in functions:
         for call_name in fn.calls:
+            # A call to one of the function's own parameter names is a local
+            # reference (an injected callback / dependency), not a module-level
+            # function. It shadows definitions everywhere — including the same
+            # file — so route it straight to the external/unresolved path instead
+            # of binding it to same-named definitions (e.g. test-file mocks).
+            if call_name in fn.param_names:
+                if include_external:
+                    _add_edge(fn.id, _external_node(call_name).id, "external")
+                continue
+
             # call_name is always a *simple* identifier (the last segment of the
             # callee expression). Prefer a free function whose qualified name is
             # exactly that simple name (an unqualified call is more likely a free
@@ -188,6 +220,11 @@ def build_graph(
 
             # Drop calls that resolve only to themselves (unless they ARE recursive)
             candidates = [c for c in candidates if c.id != fn.id or len(candidates) == 1]
+
+            # Narrow ambiguous matches to the call's real target so unrelated
+            # same-named functions (e.g. helpers in test files) aren't pulled
+            # into the downstream flow as spurious callees.
+            candidates = _disambiguate(fn, candidates)
 
             confidence = "definite" if len(candidates) == 1 else "possible"
             if confidence == "possible" and not include_possible:

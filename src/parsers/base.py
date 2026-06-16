@@ -126,6 +126,7 @@ class LanguageParser(FlowBuilder):
                         end_line=end_line + 1,
                         source_code=src,
                         language=self.LANGUAGE_NAME,
+                        param_names=self._extract_param_names(node),
                     )
                     # Extract the structured control-flow of the body for the
                     # flowchart view. Best-effort: any failure leaves flow empty
@@ -214,6 +215,75 @@ class LanguageParser(FlowBuilder):
             class_name = cpp_class
 
         return class_name, fname
+
+    # Node types that wrap a parameter binding together with a default value
+    # and/or a type annotation. We only descend into the *binding* side of these
+    # so default-value expressions (e.g. ``cb = makeDefault()``) and type names
+    # (e.g. ``x: SomeType``) are not mistaken for parameter names.
+    _PARAM_WRAPPER_TYPES = frozenset(
+        {
+            "assignment_pattern",  # JS/TS  cb = default
+            "default_parameter",  # Python a=1
+            "typed_default_parameter",  # Python a: int = 1
+            "typed_parameter",  # Python a: int
+            "optional_parameter",  # TS a?: T
+            "required_parameter",  # TS a: T
+        }
+    )
+    _PARAM_WRAPPER_BINDING_FIELDS = ("pattern", "left", "name")
+    # Leaf node types that are actual parameter *bindings* (names introduced into
+    # the function scope), as opposed to type identifiers or property keys.
+    _PARAM_BINDING_LEAF_TYPES = frozenset(
+        {"identifier", "shorthand_property_identifier_pattern"}
+    )
+
+    def _extract_param_names(self, func_node) -> set[str]:
+        """Collect the binding names introduced by a function's parameter list.
+
+        Handles plain params, destructured object/array patterns (``{ a, b }``,
+        ``[a, b]``), renamed destructuring (``{ a: b }`` → ``b``) and rest params.
+        Default-value expressions and type annotations are deliberately skipped so
+        a real callee referenced there is not misread as a parameter name. Always
+        best-effort: any failure yields an empty set rather than breaking parsing.
+        """
+        params = func_node.child_by_field_name("parameters")
+        if params is None:
+            # Single-identifier arrow functions (``x => ...``) expose the param
+            # under the "parameter" field instead of a parameter list.
+            params = func_node.child_by_field_name("parameter")
+        if params is None:
+            for child in func_node.children:
+                if "parameter" in child.type:
+                    params = child
+                    break
+        if params is None:
+            return set()
+
+        names: set[str] = set()
+
+        def collect(n) -> None:
+            if n.type in self._PARAM_BINDING_LEAF_TYPES:
+                names.add(n.text.decode("utf-8"))
+                return
+            if n.type in self._PARAM_WRAPPER_TYPES:
+                for fname in self._PARAM_WRAPPER_BINDING_FIELDS:
+                    binding = n.child_by_field_name(fname)
+                    if binding is not None:
+                        collect(binding)
+                        return
+                # No named binding field — fall back to the first named child,
+                # which is the binding for these node types across grammars.
+                if n.named_children:
+                    collect(n.named_children[0])
+                return
+            for child in n.named_children:
+                collect(child)
+
+        try:
+            collect(params)
+        except Exception:
+            return set()
+        return names
 
     def _extract_call_name(self, node) -> str | None:
         """Extract called function/method name from a call node."""

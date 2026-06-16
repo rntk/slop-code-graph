@@ -17,6 +17,7 @@ def make_fn(**kwargs):
         language=kwargs.get("language", "python"),
         calls=kwargs.get("calls", []),
         flow=kwargs.get("flow", []),
+        param_names=kwargs.get("param_names", set()),
     )
 
 
@@ -80,6 +81,51 @@ def test_build_graph_self_call_dropped_when_ambiguous():
     assert len(edges_to_f1) == 0
     assert len(edges_to_f2) == 1
     assert edges_to_f2[0].confidence == "definite"
+
+
+def test_disambiguate_prefers_same_file():
+    # caller and one `bar` live in /a.py; a colliding `bar` lives in /b.py.
+    # The same-file definition is the real (lexically scoped) target.
+    caller = make_fn(id="c", name="foo", calls=["bar"], file="/a.py")
+    local = make_fn(id="local", name="bar", file="/a.py")
+    other = make_fn(id="other", name="bar", file="/b.py")
+
+    graph = build_graph([caller, local, other])
+
+    edges = [e for e in graph.edges if e.source == "c"]
+    assert len(edges) == 1
+    assert edges[0].target == "local"
+    assert edges[0].confidence == "definite"
+
+
+def test_call_to_own_parameter_is_not_resolved_in_project():
+    # `confirm` is a parameter (injected callback) of `handler`; calling it must
+    # not bind to module-level `confirm` definitions elsewhere (e.g. test mocks).
+    handler = make_fn(
+        id="h", name="handler", calls=["confirm"], file="/main.js", param_names={"confirm"}
+    )
+    mock = make_fn(id="m", name="confirm", file="/main.test.js")
+
+    graph = build_graph([handler, mock], include_external=True)
+
+    # No in-project edge to the same-named definition…
+    assert not [e for e in graph.edges if e.target == "m"]
+    # …the call surfaces as an external/unresolved reference instead.
+    ext = [e for e in graph.edges if e.confidence == "external" and e.source == "h"]
+    assert len(ext) == 1
+    assert ext[0].target == "external::confirm"
+
+
+def test_call_to_own_parameter_shadows_same_file_definition():
+    # Parameter shadowing applies within the same file too.
+    handler = make_fn(
+        id="h", name="handler", calls=["cb"], file="/a.js", param_names={"cb"}
+    )
+    same_file_cb = make_fn(id="cb", name="cb", file="/a.js")
+
+    graph = build_graph([handler, same_file_cb], include_external=False)
+
+    assert not [e for e in graph.edges if e.target == "cb"]
 
 
 def test_build_graph_qualified_match():
