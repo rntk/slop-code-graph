@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application source and hand ownership to appuser
 COPY graph.py .
 COPY src/ src/
+COPY llm/ llm/
 RUN chown -R appuser:appuser /app
 
 # The renderer is fully self-contained (no external JS libraries to fetch),

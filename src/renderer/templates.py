@@ -169,6 +169,24 @@ select.tb-btn {
 .edge-label { font-size: 9px; fill: #cfcfe6; pointer-events: none; }
 .edge-label-bg { fill: #1a1a2e; }
 
+/* File-group LLM summary tooltip (hover/click on the translucent file containers) */
+.group-tooltip {
+  position: fixed;
+  display: none;
+  max-width: 360px;
+  background: #111113;
+  color: #d4d4d4;
+  border: 1px solid #565676;
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.35;
+  z-index: 99999;
+  pointer-events: none;
+  box-shadow: 0 6px 18px rgba(0,0,0,0.6);
+  white-space: pre-wrap;
+}
+
 /* ── Info panel ── */
 #panel {
   width: 340px;
@@ -416,6 +434,8 @@ select.tb-btn {
   <span id="stat-files">0 files</span>
   <span id="stat-selection"></span>
 </div>
+
+<div id="group-tooltip" class="group-tooltip"></div>
 
 <script>
 @@ENGINE@@

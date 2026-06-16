@@ -27,3 +27,4 @@ This is a CLI Python script which generates an interactive, self-contained HTML 
    - `-o, --output` — output HTML file path (default: `graph.html`)
    - `--no-possible` — exclude low-confidence (ambiguous) call edges
    - `--no-external` — exclude external/stdlib/builtin calls, showing only in-project functions
+   - `--llm-api-url URL` — (or LLM_API_URL env) OpenAI-compatible API base for generating brief per-file summaries. When set, functions are grouped visually by file and each file's concatenated bodies (of nodes participating in the rendered flow) are sent to the LLM (via llm/llamacpp.py) for a terse role/purpose description. These descriptions appear as on-hover / on-click tooltips over the file group containers in the SVG graph, and are also shown in the selection panel.

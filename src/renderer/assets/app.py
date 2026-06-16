@@ -24,6 +24,71 @@ const gv = new GraphView(document.getElementById('cy'), {
   onBgTap: () => closePanel(),
 });
 
+// ── File group summaries (for visual grouping tooltips) ─────────────────────
+// We show a single custom tooltip (the styled div) on hover/click over the
+// file group containers (the rounded boxes produced when "Group by file" is on).
+// We deliberately do NOT inject native SVG <title> elements, which would cause
+// the browser to show a second, duplicate native tooltip with the same text.
+const FILE_SUMMARIES = (GRAPH_DATA && GRAPH_DATA.fileSummaries) || {};
+const groupTipEl = document.getElementById('group-tooltip');
+
+// HTML escape for untrusted content (LLM summaries, and defensively for node
+// labels that end up in innerHTML-constructed UI). The group tooltip uses
+// textContent (safe); the info panel builds HTML strings, so we must escape
+// before interpolation.
+function escapeHtml(s) {
+  s = (s == null ? '' : String(s));
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function _positionGroupTip(x, y) {
+  if (!groupTipEl) return;
+  groupTipEl.style.left = (x + 14) + 'px';
+  groupTipEl.style.top = (y + 10) + 'px';
+}
+function showGroupTooltip(text, x, y) {
+  if (!groupTipEl || !text) return;
+  groupTipEl.textContent = text;
+  _positionGroupTip(x, y);
+  groupTipEl.style.display = 'block';
+}
+function hideGroupTooltip() {
+  if (groupTipEl) groupTipEl.style.display = 'none';
+}
+if (gv && gv.svg) {
+  gv.svg.addEventListener('mousemove', (e) => {
+    const g = e.target && e.target.closest ? e.target.closest('.gv-group') : null;
+    if (g) {
+      const lbl = g.querySelector ? g.querySelector('text') : null;
+      const key = (lbl && lbl.textContent ? lbl.textContent.trim() : '');
+      const sum = FILE_SUMMARIES[key];
+      if (sum) {
+        showGroupTooltip(sum, e.clientX, e.clientY);
+        return;
+      }
+    }
+    hideGroupTooltip();
+  });
+  gv.svg.addEventListener('mouseleave', hideGroupTooltip);
+  // Click on a group box also surfaces its summary via the same tooltip.
+  gv.svg.addEventListener('click', (e) => {
+    const g = e.target && e.target.closest ? e.target.closest('.gv-group') : null;
+    if (g) {
+      const lbl = g.querySelector ? g.querySelector('text') : null;
+      const key = (lbl && lbl.textContent ? lbl.textContent.trim() : '');
+      const sum = FILE_SUMMARIES[key];
+      if (sum) {
+        showGroupTooltip(sum, e.clientX, e.clientY);
+      }
+    }
+  });
+}
+
 // ── Layout ────────────────────────────────────────────────────────────────
 function applyLayout(name) {
   if (name === 'dagre-lr') gv.layout('dagre', { rankDir: 'LR', nodeSep: 32, rankSep: 120 });
@@ -69,6 +134,10 @@ function showPanel(data) {
   const file = data.relative_file || data.file;
   const lines = `L${data.start_line}–${data.end_line}`;
 
+  const fileKey = data.relative_file || data.file || '';
+  const fileSum = (GRAPH_DATA.fileSummaries && GRAPH_DATA.fileSummaries[fileKey]) ? GRAPH_DATA.fileSummaries[fileKey] : '';
+  const safeFileSum = fileSum ? escapeHtml(fileSum) : '';
+  const safeSummary = data.summary ? escapeHtml(data.summary) : '';
   panelMeta.innerHTML = isExternal
     ? `
     <div class="info-row"><span class="info-label">Lang</span><span class="info-val">${badge}</span></div>
@@ -76,11 +145,12 @@ function showPanel(data) {
   `
     : `
     <div class="info-row"><span class="info-label">Lang</span><span class="info-val">${badge}</span></div>
-    <div class="info-row"><span class="info-label">File</span><span class="info-val" title="${data.file}">${file}</span></div>
+    <div class="info-row"><span class="info-label">File</span><span class="info-val" title="${escapeHtml(data.file || '')}">${escapeHtml(file)}</span></div>
     <div class="info-row"><span class="info-label">Lines</span><span class="info-val">${lines}</span></div>
-    ${data.class_name ? `<div class="info-row"><span class="info-label">Class</span><span class="info-val">${data.class_name}</span></div>` : ''}
+    ${data.class_name ? `<div class="info-row"><span class="info-label">Class</span><span class="info-val">${escapeHtml(data.class_name)}</span></div>` : ''}
     <div class="info-row"><span class="info-label">Flow</span><span class="info-val">${data.is_entrypoint ? '🟢 Entrypoint (flow root)' : 'depth ' + data.depth + ' from entrypoint'}</span></div>
-    ${data.summary ? `<div class="info-row"><span class="info-label">Summary</span><span class="info-val">${data.summary}</span></div>` : ''}
+    ${data.summary ? `<div class="info-row"><span class="info-label">Summary</span><span class="info-val">${safeSummary}</span></div>` : ''}
+    ${fileSum ? `<div class="info-row"><span class="info-label">File&nbsp;role</span><span class="info-val">${safeFileSum}</span></div>` : ''}
   `;
 
   // External nodes have no source; hide the source block entirely for them.
@@ -93,7 +163,10 @@ function showPanel(data) {
     ? `<div class="section-title">Calls (${calleeIds.length})</div>` +
       calleeIds.map((tid) => {
         const t = nodeById[tid];
-        return t ? `<span class="fn-link" data-id="${tid}" title="${t.relative_file || t.file}: ${t.qualified_name}">${t.qualified_name}</span>` : '';
+        if (!t) return '';
+        const f = escapeHtml(t.relative_file || t.file || '');
+        const q = escapeHtml(t.qualified_name || t.name || '');
+        return `<span class="fn-link" data-id="${tid}" title="${f}: ${q}">${q}</span>`;
       }).join('')
     : '';
 
@@ -103,7 +176,10 @@ function showPanel(data) {
     ? `<div class="section-title">Called by (${callerIds.length})</div>` +
       callerIds.map((sid) => {
         const s = nodeById[sid];
-        return s ? `<span class="fn-link" data-id="${sid}" title="${s.relative_file || s.file}: ${s.qualified_name}">${s.qualified_name}</span>` : '';
+        if (!s) return '';
+        const f = escapeHtml(s.relative_file || s.file || '');
+        const q = escapeHtml(s.qualified_name || s.name || '');
+        return `<span class="fn-link" data-id="${sid}" title="${f}: ${q}">${q}</span>`;
       }).join('')
     : '';
 
@@ -225,11 +301,13 @@ document.getElementById('btn-reset-flow').addEventListener('click', resetFlow);
 const flowsMenu = document.getElementById('flows-menu');
 const flowsBtn = document.getElementById('btn-flows');
 flowsMenu.innerHTML = ENTRYPOINTS.length
-  ? ENTRYPOINTS.map((n) =>
-      `<div class="flow-item" data-id="${n.id}">` +
-      `<div class="fi-name">${n.qualified_name}</div>` +
-      `<div class="fi-file">${n.relative_file || n.file || ''}</div></div>`
-    ).join('')
+  ? ENTRYPOINTS.map((n) => {
+      const q = escapeHtml(n.qualified_name || n.name || '');
+      const f = escapeHtml(n.relative_file || n.file || '');
+      return `<div class="flow-item" data-id="${n.id}">` +
+             `<div class="fi-name">${q}</div>` +
+             `<div class="fi-file">${f}</div></div>`;
+    }).join('')
   : '<div class="fi-empty">No entrypoints detected</div>';
 flowsBtn.textContent = `Flows (${ENTRYPOINTS.length}) ▾`;
 
@@ -282,9 +360,11 @@ searchInput.addEventListener('input', function () {
   if (results.length > 0) {
     searchResults.innerHTML = results.slice(0, 20).map((r) => {
       const n = r.item;
+      const q = escapeHtml(n.qualified_name || n.name || '');
+      const f = escapeHtml(n.relative_file || n.file || '');
       return `<div class="sr-item" data-id="${n.id}">
-        <span class="sr-name">${n.qualified_name}</span>
-        <span class="sr-file">${n.relative_file || n.file}</span>
+        <span class="sr-name">${q}</span>
+        <span class="sr-file">${f}</span>
       </div>`;
     }).join('');
     searchResults.classList.add('visible');

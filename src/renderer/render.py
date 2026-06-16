@@ -18,7 +18,7 @@ from .assets import treemap as treemap_assets
 from .templates import HTML_TEMPLATE
 
 
-def _serialize_graph(graph: CallGraph) -> str:
+def _serialize_graph(graph: CallGraph, file_summaries: dict[str, str] | None = None) -> str:
     """Convert the CallGraph to a compact JSON string for embedding.
 
     The produced JSON is placed into the @@GRAPHDATA@@ placeholder inside
@@ -59,17 +59,20 @@ def _serialize_graph(graph: CallGraph) -> str:
         for e in graph.edges
     ]
 
+    payload = {"nodes": nodes_data, "edges": edges_data}
+    if file_summaries:
+        payload["fileSummaries"] = file_summaries
     graph_data_json = json.dumps(
-        {"nodes": nodes_data, "edges": edges_data},
+        payload,
         ensure_ascii=False,
         separators=(",", ":"),
     ).replace("</", "<\\/")
     return graph_data_json
 
 
-def render(graph: CallGraph, title: str) -> str:
+def render(graph: CallGraph, title: str, file_summaries: dict[str, str] | None = None) -> str:
     """Render a CallGraph to a fully self-contained, dependency-free HTML string."""
-    graph_data_json = _serialize_graph(graph)
+    graph_data_json = _serialize_graph(graph, file_summaries)
 
     # Token replacement (not str.format) so embedded CSS/JS braces need no
     # escaping. Scripts are injected first; the (escaped) graph data goes last

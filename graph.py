@@ -5,11 +5,13 @@ Usage:
   python graph.py <file_or_directory> -o graph.html
   python graph.py src/main.py -o out.html
   python graph.py ./my_project -o out.html
+  python graph.py ./my_project -o out.html --llm-api-url http://localhost:8080
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -118,6 +120,71 @@ def collect_files(path: Path) -> list[Path]:
     return sorted(files)
 
 
+def _build_file_summaries(graph: "CallGraph", llm) -> dict[str, str]:
+    """Group nodes by file, concat bodies of flow-used functions, ask LLM for brief file summary.
+
+    The summaries describe the *role of the file* within the pruned downstream flow.
+    Keys are the relative_file strings used for visual grouping.
+    """
+    from collections import defaultdict
+
+    by_file: dict[str, list] = defaultdict(list)
+    for n in graph.nodes:
+        if getattr(n, "language", None) == "external":
+            continue
+        key = getattr(n, "relative_file", None) or getattr(n, "file", None)
+        if not key:
+            continue
+        by_file[key].append(n)
+
+    SYSTEM_PROMPT = (
+        "You are a senior engineer. The user will give you the concatenated source "
+        "bodies of several functions that all live in ONE source file and participate "
+        "in a call graph flow. Write a very brief (1-3 sentences) description of what "
+        "this file does / contributes in the context of the flow. Focus on purpose and "
+        "high-level responsibility. Be terse. Output plain text only, no labels or markdown."
+    )
+
+    summaries: dict[str, str] = {}
+    BUDGET = 9200  # characters of source to stay well under context
+    for rel in sorted(by_file.keys()):
+        nodes = by_file[rel]
+        # Order for readability: shallower depth first, then source order inside file
+        nodes_sorted = sorted(
+            nodes,
+            key=lambda n: (getattr(n, "depth", 0), getattr(n, "start_line", 0)),
+        )
+
+        parts: list[str] = []
+        used = 0
+        for n in nodes_sorted:
+            qn = getattr(n, "qualified_name", getattr(n, "name", "fn"))
+            hdr = f"\n### {qn} (L{getattr(n,'start_line',0)}-{getattr(n,'end_line',0)})\n"
+            body = getattr(n, "source_code", "") or ""
+            chunk = hdr + body
+            if used + len(chunk) > BUDGET and parts:
+                break
+            parts.append(chunk)
+            used += len(chunk)
+        snippet = "".join(parts).strip()
+        if not snippet:
+            continue
+
+        user_prompt = f"FILE: {rel}\n\nFunctions from this file that appear in the flow:\n{snippet}\n\nBrief summary of this file's role:"
+
+        try:
+            resp = llm.complete(user_prompt=user_prompt, system_prompt=SYSTEM_PROMPT, temperature=0.1)
+            text = (resp.content or "").strip()
+            if text:
+                # keep reasonably short for UI tooltip
+                summaries[rel] = text[:600]
+        except Exception:
+            # per-file resilience; continue with other files
+            continue
+
+    return summaries
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate an interactive call-graph HTML from source code.",
@@ -135,6 +202,11 @@ def main():
         "--no-external",
         action="store_true",
         help="Exclude external/stdlib/builtin calls (only show in-project functions)",
+    )
+    parser.add_argument(
+        "--llm-api-url",
+        default=os.environ.get("LLM_API_URL"),
+        help="Base URL of an OpenAI-compatible LLM API (e.g. http://host:port) for file-level flow summaries. Also reads LLM_API_URL env var. When provided, per-file summaries are generated from concatenated function bodies and attached to file groups in the graph.",
     )
     args = parser.parse_args()
 
@@ -224,10 +296,32 @@ def main():
         f"{external} external edge(s) to {ext_nodes} external node(s)"
     )
 
+    # ── Optional LLM file-level summaries ───────────────────────────────────
+    # When --llm-api-url (or LLM_API_URL) is provided we use the LlamaCPP
+    # client to produce a brief description for each file that contributes
+    # functions to the (pruned) flow. We concatenate the bodies of the
+    # functions from that file (ordered by depth then source order) and ask
+    # for a terse high-level summary of the file's role in the flow. These
+    # summaries are attached under file keys so the frontend can show them
+    # as hover/click tooltips over the visual file-group containers.
+    file_summaries: dict[str, str] = {}
+    llm_url = args.llm_api_url
+    if llm_url:
+        print("Requesting LLM file summaries…")
+        try:
+            from llm.llamacpp import LLamaCPP
+
+            llm_client = LLamaCPP(host=llm_url, temperature=0.1, max_retries=2)
+            file_summaries = _build_file_summaries(graph, llm_client)
+            filled = sum(1 for v in file_summaries.values() if v)
+            print(f"  LLM summaries generated for {filled} file(s)")
+        except Exception as e:
+            print(f"  Warning: LLM file summary generation skipped: {e}")
+
     # Render HTML
     title = target.name
     print("Rendering HTML…")
-    html = render(graph, title)
+    html = render(graph, title, file_summaries=file_summaries)
 
     # Write output
     out = Path(args.output)
