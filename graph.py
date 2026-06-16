@@ -15,7 +15,7 @@ import os
 import sys
 from pathlib import Path
 
-from src.graph_builder import build_graph, compute_flow_metadata
+from src.graph_builder import CallGraph, build_graph, compute_flow_metadata
 from src.parsers import get_registry, parse_files
 from src.renderer import render
 
@@ -120,12 +120,14 @@ def collect_files(path: Path) -> list[Path]:
     return sorted(files)
 
 
-def _build_file_summaries(graph: "CallGraph", llm) -> dict[str, str]:
+def _build_file_summaries(graph: CallGraph, llm, cache_dir: Path | None = None) -> dict[str, str]:
     """Group nodes by file, concat bodies of flow-used functions, ask LLM for brief file summary.
 
     The summaries describe the *role of the file* within the pruned downstream flow.
     Keys are the relative_file strings used for visual grouping.
     """
+    import hashlib
+    import json
     from collections import defaultdict
 
     by_file: dict[str, list] = defaultdict(list)
@@ -137,7 +139,7 @@ def _build_file_summaries(graph: "CallGraph", llm) -> dict[str, str]:
             continue
         by_file[key].append(n)
 
-    SYSTEM_PROMPT = (
+    system_prompt = (
         "You are a senior engineer. The user will give you the concatenated source "
         "bodies of several functions that all live in ONE source file and participate "
         "in a call graph flow. Write a very brief (1-3 sentences) description of what "
@@ -145,8 +147,20 @@ def _build_file_summaries(graph: "CallGraph", llm) -> dict[str, str]:
         "high-level responsibility. Be terse. Output plain text only, no labels or markdown."
     )
 
+    cache: dict[str, str] = {}
+    cache_file = None
+    if cache_dir:
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_file = cache_dir / "graph_llm_cache.json"
+            if cache_file.exists():
+                with open(cache_file, encoding="utf-8") as f:
+                    cache = json.load(f)
+        except Exception as e:
+            print(f"  Warning: failed to load LLM cache: {e}")
+
     summaries: dict[str, str] = {}
-    BUDGET = 9200  # characters of source to stay well under context
+    budget = 9200  # characters of source to stay well under context
     for rel in sorted(by_file.keys()):
         nodes = by_file[rel]
         # Order for readability: shallower depth first, then source order inside file
@@ -159,10 +173,10 @@ def _build_file_summaries(graph: "CallGraph", llm) -> dict[str, str]:
         used = 0
         for n in nodes_sorted:
             qn = getattr(n, "qualified_name", getattr(n, "name", "fn"))
-            hdr = f"\n### {qn} (L{getattr(n,'start_line',0)}-{getattr(n,'end_line',0)})\n"
+            hdr = f"\n### {qn} (L{getattr(n, 'start_line', 0)}-{getattr(n, 'end_line', 0)})\n"
             body = getattr(n, "source_code", "") or ""
             chunk = hdr + body
-            if used + len(chunk) > BUDGET and parts:
+            if used + len(chunk) > budget and parts:
                 break
             parts.append(chunk)
             used += len(chunk)
@@ -172,12 +186,31 @@ def _build_file_summaries(graph: "CallGraph", llm) -> dict[str, str]:
 
         user_prompt = f"FILE: {rel}\n\nFunctions from this file that appear in the flow:\n{snippet}\n\nBrief summary of this file's role:"
 
+        # Generate a stable hash-based key for the cache using both prompts
+        prompt_key = hashlib.sha256(
+            (system_prompt + "\n" + user_prompt).encode("utf-8")
+        ).hexdigest()
+
+        if prompt_key in cache:
+            summaries[rel] = cache[prompt_key]
+            continue
+
         try:
-            resp = llm.complete(user_prompt=user_prompt, system_prompt=SYSTEM_PROMPT, temperature=0.1)
+            resp = llm.complete(
+                user_prompt=user_prompt, system_prompt=system_prompt, temperature=0.1
+            )
             text = (resp.content or "").strip()
             if text:
                 # keep reasonably short for UI tooltip
-                summaries[rel] = text[:600]
+                summary_text = text[:600]
+                summaries[rel] = summary_text
+                if cache_file is not None:
+                    cache[prompt_key] = summary_text
+                    try:
+                        with open(cache_file, "w", encoding="utf-8") as f:
+                            json.dump(cache, f, ensure_ascii=False, indent=2)
+                    except Exception as e:
+                        print(f"  Warning: failed to write LLM cache: {e}")
         except Exception:
             # per-file resilience; continue with other files
             continue
@@ -312,7 +345,8 @@ def main():
             from llm.llamacpp import LLamaCPP
 
             llm_client = LLamaCPP(host=llm_url, temperature=0.1, max_retries=2)
-            file_summaries = _build_file_summaries(graph, llm_client)
+            cache_dir = collect_from / ".traverse-cache"
+            file_summaries = _build_file_summaries(graph, llm_client, cache_dir=cache_dir)
             filled = sum(1 for v in file_summaries.values() if v)
             print(f"  LLM summaries generated for {filled} file(s)")
         except Exception as e:
