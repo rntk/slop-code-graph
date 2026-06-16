@@ -13,7 +13,7 @@ const gv = new GraphView(document.getElementById('cy'), {
   edges: GRAPH_DATA.edges,
   nodeClasses: (n) => n.language + (n.language === 'external' ? ' external' : '') + (n.is_entrypoint ? ' entrypoint' : ''),
   shapeOf: (n) => (n.language === 'external' ? 'round-tag' : 'round-rectangle'),
-  // Group function nodes into file containers in the hierarchical layout.
+  // Group function nodes into file containers in graph layouts.
   // External (stdlib/builtin) nodes are deduped across files, so they belong to
   // no single file and stay ungrouped (null).
   groupOf: (n) => (n.language === 'external' ? null : (n.relative_file || n.file || null)),
@@ -165,8 +165,7 @@ document.getElementById('btn-external').addEventListener('click', function () {
   applyLayout(document.getElementById('layout-select').value);
 });
 
-// Toggle file-container grouping, then re-run the current layout. Boxes only
-// appear in the hierarchical (dagre) layouts; cose/concentric ignore grouping.
+// Toggle file-container grouping, then re-run the current layout.
 let groupByFile = true;
 document.getElementById('btn-group').addEventListener('click', function () {
   groupByFile = !groupByFile;

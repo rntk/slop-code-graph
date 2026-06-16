@@ -357,7 +357,7 @@ select.tb-btn {
 
   <button class="tb-btn active" id="btn-possible" title="Toggle low-confidence edges" data-graph-only>Possible edges</button>
   <button class="tb-btn active" id="btn-external" title="Toggle external / stdlib / builtin calls" data-graph-only>External calls</button>
-  <button class="tb-btn active" id="btn-group" title="Group functions into file containers (hierarchical layouts only)" data-graph-only>Group by file</button>
+  <button class="tb-btn active" id="btn-group" title="Group functions into file containers" data-graph-only>Group by file</button>
 
   <div class="tb-sep" data-graph-only></div>
 

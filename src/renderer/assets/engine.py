@@ -74,8 +74,7 @@ class GraphView {
     this.maxZoom = 8;
     this._id = ++GV_SEQ;
     // File grouping: on by default when the caller supplies a groupOf accessor.
-    // _dagreGrouped fills _groupBoxes (absolute file-container rects); other
-    // layouts leave it empty so no boxes are drawn.
+    // Grouped layouts fill _groupBoxes with absolute file-container rects.
     this.grouping = !!(this.o && this.o.groupOf);
     this._groupBoxes = [];
     this._build();
@@ -582,19 +581,23 @@ class GraphView {
   }
 
   _cose() {
+    if (this.grouping && this.o.groupOf) {
+      this._groupedLayout('cose');
+      return;
+    }
     this._groupBoxes = [];
     const ids = [...this.N.keys()].filter((i) => !this.N.get(i).hidden);
-    const n = ids.length;
-    if (!n) return;
-    const R = Math.max(200, n * 28);
+    const edges = this._visibleEdges(ids);
+    const pos = this._layoutCose(ids, edges);
+    ids.forEach((id) => { const p = pos.get(id), nn = this.N.get(id); nn.x = p.x; nn.y = p.y; });
+  }
+
+  _layoutCose(ids, edges) {
     const pos = new Map();
+    const n = ids.length;
+    if (!n) return pos;
+    const R = Math.max(200, n * 28);
     ids.forEach((id, i) => { const a = 2 * Math.PI * i / n; pos.set(id, { x: Math.cos(a) * R, y: Math.sin(a) * R }); });
-    const edges = [];
-    this.E.forEach((e) => {
-      if (e.hidden) return;
-      const s = e.data.source, t = e.data.target;
-      if (s !== t && pos.has(s) && pos.has(t)) edges.push([s, t]);
-    });
     const k = 120, area = k * k;
     let temp = R;
     const iters = n > 400 ? 150 : 280;
@@ -629,18 +632,28 @@ class GraphView {
       });
       temp *= 0.97;
     }
-    ids.forEach((id) => { const p = pos.get(id), nn = this.N.get(id); nn.x = p.x; nn.y = p.y; });
+    return pos;
   }
 
   _concentric() {
+    if (this.grouping && this.o.groupOf) {
+      this._groupedLayout('concentric');
+      return;
+    }
     this._groupBoxes = [];
     const ids = [...this.N.keys()].filter((i) => !this.N.get(i).hidden);
-    if (!ids.length) return;
+    const edges = this._visibleEdges(ids);
+    const pos = this._layoutConcentric(ids, edges);
+    ids.forEach((id) => { const p = pos.get(id), nn = this.N.get(id); nn.x = p.x; nn.y = p.y; });
+  }
+
+  _layoutConcentric(ids, edges) {
+    const pos = new Map();
+    if (!ids.length) return pos;
     const deg = new Map(ids.map((i) => [i, 0]));
-    this.E.forEach((e) => {
-      if (e.hidden) return;
-      if (deg.has(e.data.source)) deg.set(e.data.source, deg.get(e.data.source) + 1);
-      if (deg.has(e.data.target)) deg.set(e.data.target, deg.get(e.data.target) + 1);
+    edges.forEach(([s, t]) => {
+      if (deg.has(s)) deg.set(s, deg.get(s) + 1);
+      if (deg.has(t)) deg.set(t, deg.get(t) + 1);
     });
     const sorted = [...ids].sort((a, b) => deg.get(b) - deg.get(a));
     const maxd = deg.get(sorted[0]) || 0;
@@ -656,11 +669,138 @@ class GraphView {
       const r = li === 0 && cnt === 1 ? 0 : (li === 0 ? 120 : li * 170);
       arr.forEach((id, i) => {
         const a = 2 * Math.PI * i / Math.max(1, cnt) - Math.PI / 2;
-        const nn = this.N.get(id);
-        nn.x = r === 0 ? 0 : Math.cos(a) * r;
-        nn.y = r === 0 ? 0 : Math.sin(a) * r;
+        pos.set(id, {
+          x: r === 0 ? 0 : Math.cos(a) * r,
+          y: r === 0 ? 0 : Math.sin(a) * r,
+        });
       });
     });
+    return pos;
+  }
+
+  _visibleEdges(ids) {
+    const idset = new Set(ids);
+    const E = [];
+    this.E.forEach((e) => {
+      if (e.hidden) return;
+      const s = e.data.source, t = e.data.target;
+      if (s !== t && idset.has(s) && idset.has(t)) E.push([s, t]);
+    });
+    return E;
+  }
+
+  _layoutByMode(mode, ids, edges) {
+    return mode === 'concentric'
+      ? this._layoutConcentric(ids, edges)
+      : this._layoutCose(ids, edges);
+  }
+
+  _separateMetaBoxes(metaIds, pos, sizeOf) {
+    const GAP = 42;
+    for (let it = 0; it < 80; it++) {
+      let moved = false;
+      for (let a = 0; a < metaIds.length; a++) {
+        for (let b = a + 1; b < metaIds.length; b++) {
+          const ia = metaIds[a], ib = metaIds[b];
+          const pa = pos.get(ia), pb = pos.get(ib);
+          const sa = sizeOf.get(ia), sb = sizeOf.get(ib);
+          const minDx = (sa.w + sb.w) / 2 + GAP;
+          const minDy = (sa.h + sb.h) / 2 + GAP;
+          let dx = pb.x - pa.x, dy = pb.y - pa.y;
+          if (Math.abs(dx) >= minDx || Math.abs(dy) >= minDy) continue;
+          if (Math.abs(dx) / minDx < Math.abs(dy) / minDy) {
+            const push = (minDx - Math.abs(dx)) / 2;
+            const dir = dx < 0 ? -1 : 1;
+            pa.x -= dir * push; pb.x += dir * push;
+          } else {
+            const push = (minDy - Math.abs(dy)) / 2;
+            const dir = dy < 0 ? -1 : 1;
+            pa.y -= dir * push; pb.y += dir * push;
+          }
+          moved = true;
+        }
+      }
+      if (!moved) break;
+    }
+  }
+
+  _groupedLayout(mode) {
+    const PAD = 16;
+    const HEADER = 26;
+    const all = [...this.N.keys()].filter((i) => !this.N.get(i).hidden);
+    if (!all.length) { this._groupBoxes = []; return; }
+
+    const keyOf = (id) => this.o.groupOf(this.N.get(id).data);
+    const groups = new Map();
+    const loners = [];
+    all.forEach((id) => {
+      const k = keyOf(id);
+      if (k == null || k === '') { loners.push(id); return; }
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(id);
+    });
+
+    const E = this._visibleEdges(all);
+    const intra = new Map();
+    const metaSize = new Map();
+    const metaColor = new Map();
+    const metaLabel = new Map();
+
+    groups.forEach((gids, key) => {
+      const gset = new Set(gids);
+      const gE = E.filter(([s, t]) => gset.has(s) && gset.has(t));
+      const gpos = this._layoutByMode(mode, gids, gE);
+      let minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+      gids.forEach((id) => {
+        const n = this.N.get(id), p = gpos.get(id);
+        minX = Math.min(minX, p.x - n.w / 2); maxX = Math.max(maxX, p.x + n.w / 2);
+        minY = Math.min(minY, p.y - n.h / 2); maxY = Math.max(maxY, p.y + n.h / 2);
+      });
+      gids.forEach((id) => {
+        const p = gpos.get(id);
+        intra.set(id, { x: p.x - minX + PAD, y: p.y - minY + PAD + HEADER });
+      });
+      metaSize.set(key, { w: (maxX - minX) + PAD * 2, h: (maxY - minY) + PAD * 2 + HEADER });
+      const first = this.N.get(gids[0]);
+      metaColor.set(key, first && first.data ? first.data.color : null);
+      metaLabel.set(key, key);
+    });
+    loners.forEach((id) => {
+      const n = this.N.get(id);
+      metaSize.set(id, { w: n.w, h: n.h });
+    });
+
+    const metaOf = (id) => { const k = keyOf(id); return (k == null || k === '') ? id : k; };
+    const metaIds = [...groups.keys(), ...loners];
+    const metaSeen = new Set();
+    const metaE = [];
+    E.forEach(([s, t]) => {
+      const ms = metaOf(s), mt = metaOf(t);
+      if (ms === mt) return;
+      const k = ms + '##' + mt;
+      if (metaSeen.has(k)) return;
+      metaSeen.add(k);
+      metaE.push([ms, mt]);
+    });
+
+    const mpos = this._layoutByMode(mode, metaIds, metaE);
+    this._separateMetaBoxes(metaIds, mpos, metaSize);
+
+    const boxes = [];
+    groups.forEach((gids, key) => {
+      const c = mpos.get(key), sz = metaSize.get(key);
+      const x0 = c.x - sz.w / 2, y0 = c.y - sz.h / 2;
+      gids.forEach((id) => {
+        const rel = intra.get(id), n = this.N.get(id);
+        n.x = x0 + rel.x; n.y = y0 + rel.y;
+      });
+      boxes.push({ x: x0, y: y0, w: sz.w, h: sz.h, label: metaLabel.get(key), color: metaColor.get(key) });
+    });
+    loners.forEach((id) => {
+      const c = mpos.get(id), n = this.N.get(id);
+      n.x = c.x; n.y = c.y;
+    });
+    this._groupBoxes = boxes;
   }
 
   // ---- viewport helpers -------------------------------------------------
@@ -671,6 +811,10 @@ class GraphView {
     nodes.forEach((n) => {
       minX = Math.min(minX, n.x - n.w / 2); maxX = Math.max(maxX, n.x + n.w / 2);
       minY = Math.min(minY, n.y - n.h / 2); maxY = Math.max(maxY, n.y + n.h / 2);
+    });
+    (this._groupBoxes || []).forEach((b) => {
+      minX = Math.min(minX, b.x); maxX = Math.max(maxX, b.x + b.w);
+      minY = Math.min(minY, b.y); maxY = Math.max(maxY, b.y + b.h);
     });
     const cw = this.c.clientWidth || 800, ch = this.c.clientHeight || 600;
     const w = Math.max(1, maxX - minX), h = Math.max(1, maxY - minY);
