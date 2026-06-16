@@ -12,13 +12,18 @@ import json
 
 from ..graph_builder import CallGraph
 from .assets import app as app_assets
+from .assets import canvas as canvas_assets
 from .assets import engine as engine_assets
 from .assets import flow as flow_assets
 from .assets import treemap as treemap_assets
 from .templates import HTML_TEMPLATE
 
 
-def _serialize_graph(graph: CallGraph, file_summaries: dict[str, str] | None = None) -> str:
+def _serialize_graph(
+    graph: CallGraph,
+    file_summaries: dict[str, str] | None = None,
+    canvas: dict | None = None,
+) -> str:
     """Convert the CallGraph to a compact JSON string for embedding.
 
     The produced JSON is placed into the @@GRAPHDATA@@ placeholder inside
@@ -62,6 +67,8 @@ def _serialize_graph(graph: CallGraph, file_summaries: dict[str, str] | None = N
     payload = {"nodes": nodes_data, "edges": edges_data}
     if file_summaries:
         payload["fileSummaries"] = file_summaries
+    if canvas:
+        payload["canvas"] = canvas
     graph_data_json = json.dumps(
         payload,
         ensure_ascii=False,
@@ -70,9 +77,14 @@ def _serialize_graph(graph: CallGraph, file_summaries: dict[str, str] | None = N
     return graph_data_json
 
 
-def render(graph: CallGraph, title: str, file_summaries: dict[str, str] | None = None) -> str:
+def render(
+    graph: CallGraph,
+    title: str,
+    file_summaries: dict[str, str] | None = None,
+    canvas: dict | None = None,
+) -> str:
     """Render a CallGraph to a fully self-contained, dependency-free HTML string."""
-    graph_data_json = _serialize_graph(graph, file_summaries)
+    graph_data_json = _serialize_graph(graph, file_summaries, canvas)
 
     # Token replacement (not str.format) so embedded CSS/JS braces need no
     # escaping. Scripts are injected first; the (escaped) graph data goes last
@@ -84,6 +96,8 @@ def render(graph: CallGraph, title: str, file_summaries: dict[str, str] | None =
     out = out.replace("@@FLOWSCRIPT@@", flow_assets.FLOW_SCRIPT)
     out = out.replace("@@TREEMAPSTYLE@@", treemap_assets.TREEMAP_STYLE)
     out = out.replace("@@TREEMAPSCRIPT@@", treemap_assets.TREEMAP_SCRIPT)
+    out = out.replace("@@CANVASSTYLE@@", canvas_assets.CANVAS_STYLE)
+    out = out.replace("@@CANVASSCRIPT@@", canvas_assets.CANVAS_SCRIPT)
     out = out.replace("@@TITLE@@", html.escape(title, quote=True))
     out = out.replace("@@GRAPHDATA@@", graph_data_json)
     return out

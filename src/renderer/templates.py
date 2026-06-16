@@ -350,6 +350,7 @@ select.tb-btn {
 
 @@FLOWSTYLE@@
 @@TREEMAPSTYLE@@
+@@CANVASSTYLE@@
 </style>
 </head>
 <body>
@@ -361,6 +362,7 @@ select.tb-btn {
   <div class="tb-tabs">
     <button class="tb-btn tb-tab active" data-view="graph" title="Function call graph">⛓ Call graph</button>
     <button class="tb-btn tb-tab" data-view="treemap" title="File / module tree map">▦ Tree map</button>
+    <button class="tb-btn tb-tab" id="tab-canvas" data-view="canvas" title="LLM topic canvas (requires LLM summaries)" style="display:none">🗂 Canvas</button>
   </div>
 
   <div class="tb-sep"></div>
@@ -412,6 +414,8 @@ select.tb-btn {
     </div>
     <div id="treemap-canvas"></div>
   </div>
+
+  <div id="canvas-view"></div>
 
   <div id="flow-view">
     <div id="flow-bar">
@@ -466,6 +470,10 @@ select.tb-btn {
 
 <script>
 @@TREEMAPSCRIPT@@
+</script>
+
+<script>
+@@CANVASSCRIPT@@
 </script>
 </body>
 </html>

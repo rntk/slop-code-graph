@@ -252,7 +252,19 @@ def main():
         default=os.environ.get("LLM_API_URL"),
         help="Base URL of an OpenAI-compatible LLM API (e.g. http://host:port) for file-level flow summaries. Also reads LLM_API_URL env var. When provided, per-file summaries are generated from concatenated function bodies and attached to file groups in the graph.",
     )
+    parser.add_argument(
+        "--canvas",
+        action="store_true",
+        help="Also build the Canvas view: glue the flow's function bodies into one "
+        "document, split it into topical sections via the LLM (topic-ranges), and "
+        "generate a terse summary per topic. Requires --llm-api-url / LLM_API_URL.",
+    )
     args = parser.parse_args()
+
+    if args.canvas and not args.llm_api_url:
+        sys.exit(
+            "Error: --canvas requires an LLM. Pass --llm-api-url or set LLM_API_URL."
+        )
 
     target = Path(args.path).resolve()
     if not target.exists():
@@ -349,24 +361,45 @@ def main():
     # summaries are attached under file keys so the frontend can show them
     # as hover/click tooltips over the visual file-group containers.
     file_summaries: dict[str, str] = {}
+    canvas_data: dict | None = None
     llm_url = args.llm_api_url
     if llm_url:
+        from llm.llamacpp import LLamaCPP
+
+        cache_dir = collect_from / ".traverse-cache"
+        llm_client = LLamaCPP(host=llm_url, temperature=0.1, max_retries=2)
+
         print("Requesting LLM file summaries…")
         try:
-            from llm.llamacpp import LLamaCPP
-
-            llm_client = LLamaCPP(host=llm_url, temperature=0.1, max_retries=2)
-            cache_dir = collect_from / ".traverse-cache"
             file_summaries = _build_file_summaries(graph, llm_client, cache_dir=cache_dir)
             filled = sum(1 for v in file_summaries.values() if v)
             print(f"  LLM summaries generated for {filled} file(s)")
         except Exception as e:
             print(f"  Warning: LLM file summary generation skipped: {e}")
 
+        # ── Optional Canvas view ────────────────────────────────────────────
+        # Glue the flow's function bodies into one document, ask the LLM to
+        # partition it into topical sections (topic-ranges), and summarize each.
+        if args.canvas:
+            print("Building Canvas view (topic split + summaries)…")
+            try:
+                from src.canvas import build_canvas_data
+
+                canvas_data = build_canvas_data(graph, llm_client, cache_dir=cache_dir)
+                if canvas_data:
+                    print(
+                        f"  Canvas: {canvas_data['stats']['topicCount']} topic(s) "
+                        f"over {canvas_data['stats']['lineCount']} line(s)"
+                    )
+                else:
+                    print("  Canvas: no summarizable flow source; view skipped")
+            except Exception as e:
+                print(f"  Warning: Canvas view generation skipped: {e}")
+
     # Render HTML
     title = target.name
     print("Rendering HTML…")
-    html = render(graph, title, file_summaries=file_summaries)
+    html = render(graph, title, file_summaries=file_summaries, canvas=canvas_data)
 
     # Write output
     out = Path(args.output)

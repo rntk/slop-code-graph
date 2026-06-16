@@ -339,19 +339,34 @@ TREEMAP_SCRIPT = r"""
   });
 
   // ── Tab switching ─────────────────────────────────────────────────────────
+  const canvasEl = document.getElementById('canvas-view');
   function switchView(view) {
     const isTree = view === 'treemap';
-    document.getElementById('cy').style.display = isTree ? 'none' : '';
+    const isCanvas = view === 'canvas';
+    const isGraph = view === 'graph';
+    document.getElementById('cy').style.display = isGraph ? '' : 'none';
     tmEl.classList.toggle('open', isTree);
+    if (canvasEl) canvasEl.classList.toggle('open', isCanvas);
     tabs.forEach((t) => t.classList.toggle('active', t.dataset.view === view));
-    graphOnly.forEach((n) => { n.style.display = isTree ? 'none' : ''; });
+    // Graph-only controls are visible only on the call-graph tab.
+    graphOnly.forEach((n) => { n.style.display = isGraph ? '' : 'none'; });
     if (isTree) {
       if (!built) { drillStack = [buildTree()]; built = true; }
       draw();
     }
+    if (isCanvas && typeof window.__buildCanvas === 'function') {
+      window.__buildCanvas();
+    }
   }
   tabs.forEach((t) => t.addEventListener('click', () => switchView(t.dataset.view)));
   window.switchView = switchView;
+
+  // Reveal the Canvas tab only when the pipeline produced canvas data.
+  if (GRAPH_DATA && GRAPH_DATA.canvas && Array.isArray(GRAPH_DATA.canvas.topics)
+      && GRAPH_DATA.canvas.topics.length) {
+    const canvasTab = document.getElementById('tab-canvas');
+    if (canvasTab) canvasTab.style.display = '';
+  }
 
   window.addEventListener('resize', () => { if (tmEl.classList.contains('open')) draw(); });
 })();
