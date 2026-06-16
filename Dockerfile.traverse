@@ -1,0 +1,66 @@
+# Stage 1: Build the React frontend
+
+# Build the image
+#docker build -f Dockerfile.traverse -t traverse .
+
+# Run the container (e.g. against the current project)
+#docker run --rm -it -p 8765:8765 -v $(pwd):/workspace -w /workspace traverse
+
+FROM node:20-slim AS frontend-builder
+WORKDIR /app/frontend
+
+# Install dependencies (no package-lock.json exists, so we use npm install)
+COPY frontend/package.json ./
+RUN npm install
+
+# Copy frontend source and build the production bundle
+COPY frontend/ ./
+RUN npm run build
+
+# Stage 2: Create the Python runtime and run the server
+FROM python:3.12-slim
+
+# Install system dependencies for tree-sitter C/C++ components compilation and git
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    make \
+    gcc \
+    libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create a non-root user with a stable UID/GID (1000) so volume-mounted
+# files and caches can be owned by a typical host user rather than root.
+RUN groupadd --gid 1000 appuser \
+ && useradd --uid 1000 --gid 1000 --create-home appuser
+
+WORKDIR /app
+
+# Install Python dependencies as root
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy backend application source
+COPY graph.py .
+COPY src/ src/
+COPY llm/ llm/
+COPY traverse/ traverse/
+
+# Copy the built React assets from the frontend build stage
+COPY --from=frontend-builder /app/frontend/dist /app/frontend/dist
+
+# Ensure the appuser owns the application files
+RUN chown -R appuser:appuser /app
+
+# Expose the default Traverse port
+EXPOSE 8765
+
+# Switch to the non-root user
+USER appuser
+
+# Set environment variables for the server
+ENV TRAVERSE_HOST=0.0.0.0
+ENV TRAVERSE_PORT=8765
+ENV PYTHONPATH=/app
+
+# Run the server
+ENTRYPOINT ["python", "-m", "traverse.server"]
