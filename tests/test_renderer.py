@@ -123,6 +123,15 @@ def test_render_includes_flowchart_assets():
         assert marker in out, marker
 
 
+def test_render_includes_summary_only_toggle():
+    graph = CallGraph(nodes=[_node()], edges=[])
+    out = render(graph, "t", file_summaries={"test.py": "Handles input validation."})
+    assert "btn-summary" in out
+    assert "Summary only" in out
+    assert "Handles input validation." in out
+    assert "fileSummaries" in out
+
+
 def test_render_embeds_flow_data():
     flow = [{"t": "if", "cond": "x > 0", "then": [], "else": []}]
     graph = CallGraph(nodes=[_node(flow=flow)], edges=[])

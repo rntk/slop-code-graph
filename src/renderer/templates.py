@@ -158,6 +158,20 @@ select.tb-btn {
    the pruned graph calls — i.e. where a flow starts. */
 .node.entrypoint .shape { stroke: #4ec9b0; stroke-width: 3px; stroke-opacity: 0.95; filter: drop-shadow(0 0 4px rgba(78,201,176,0.6)); }
 .node.entrypoint .nlabel { font-weight: 700; }
+/* Summary-only mode: one node per file showing the LLM description */
+.node.summary-node .shape {
+  fill: #2a2a42 !important;
+  stroke: #6a6a8e;
+  stroke-width: 2px;
+  stroke-opacity: 0.9;
+}
+.node.summary-node .nlabel { font-size: 11px; font-weight: 400; fill: #e8eaf4; }
+.node.summary-node.entrypoint .shape {
+  fill: #243038 !important;
+  stroke: #4ec9b0;
+  stroke-width: 2.5px;
+}
+.node.summary-node.entrypoint .nlabel tspan:first-child { font-weight: 700; font-size: 12px; fill: #6ee7c8; }
 .node.selected .shape { stroke: #ffffff; stroke-width: 3px; stroke-opacity: 0.9; }
 .node.highlighted .shape { stroke: #ffcc00; stroke-width: 2px; }
 .node.dimmed { opacity: 0.15; }
@@ -376,6 +390,7 @@ select.tb-btn {
   <button class="tb-btn active" id="btn-possible" title="Toggle low-confidence edges" data-graph-only>Possible edges</button>
   <button class="tb-btn active" id="btn-external" title="Toggle external / stdlib / builtin calls" data-graph-only>External calls</button>
   <button class="tb-btn active" id="btn-group" title="Group functions into file containers" data-graph-only>Group by file</button>
+  <button class="tb-btn" id="btn-summary" title="Show file summaries instead of function names (requires LLM summaries)" data-graph-only style="display:none">Summary only</button>
 
   <div class="tb-sep" data-graph-only></div>
 

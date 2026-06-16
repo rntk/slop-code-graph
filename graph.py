@@ -6,6 +6,10 @@ Usage:
   python graph.py src/main.py -o out.html
   python graph.py ./my_project -o out.html
   python graph.py ./my_project -o out.html --llm-api-url http://localhost:8080
+
+When LLM file summaries are generated, the HTML output includes a "Summary only"
+toolbar toggle that collapses each summarized file to a single node showing its
+description while preserving cross-file call edges.
 """
 
 from __future__ import annotations

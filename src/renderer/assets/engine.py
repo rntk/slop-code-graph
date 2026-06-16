@@ -244,8 +244,54 @@ class GraphView {
     });
   }
 
+  _resolveId(id) {
+    return (this.o.endpointOf ? (this.o.endpointOf(id) || id) : id);
+  }
+
+  setNodeLabel(id, label) {
+    const n = this.N.get(id);
+    if (!n) return;
+    const g = n.g;
+    const shape = this.o.shapeOf ? this.o.shapeOf(n.data) : shapeFromClasses(n.cls);
+    const hasText = String(label) !== '' && shape !== 'ellipse';
+    let txt = g.querySelector('text.nlabel');
+    if (!hasText) {
+      if (txt) txt.remove();
+      return;
+    }
+    if (!txt) {
+      txt = svgEl('text', { class: 'nlabel', 'text-anchor': 'middle', 'dominant-baseline': 'central' });
+      g.appendChild(txt);
+    }
+    while (txt.firstChild) txt.removeChild(txt.firstChild);
+    const lines = String(label).split('\n');
+    const lh = 12;
+    lines.forEach((ln, i) => {
+      const ts = svgEl('tspan', { x: 0 });
+      ts.setAttribute('dy', i === 0 ? -(lines.length - 1) * lh / 2 : lh);
+      ts.textContent = ln;
+      txt.appendChild(ts);
+    });
+    const bb = txt.getBBox();
+    const sz = sizeForShape(shape, bb.width, bb.height);
+    const fill = this.o.fillOf ? this.o.fillOf(n.data) : null;
+    const newShp = shapeEl(shape, sz.w, sz.h);
+    if (fill) newShp.style.fill = fill;
+    g.replaceChild(newShp, n.shp);
+    n.shp = newShp;
+    n.w = sz.w;
+    n.h = sz.h;
+  }
+
   _redrawEdge(eo) {
-    const s = this.N.get(eo.data.source), t = this.N.get(eo.data.target);
+    const sid = this._resolveId(eo.data.source);
+    const tid = this._resolveId(eo.data.target);
+    if (sid === tid) {
+      eo.path.style.display = 'none';
+      if (eo.lblEl) { eo.lblEl.style.display = 'none'; eo.lblBg.style.display = 'none'; }
+      return;
+    }
+    const s = this.N.get(sid), t = this.N.get(tid);
     const hide = !s || !t || s.hidden || t.hidden || eo.hidden;
     if (hide) {
       eo.path.style.display = 'none';
@@ -344,12 +390,7 @@ class GraphView {
     const all = [...this.N.keys()].filter((i) => !this.N.get(i).hidden);
     if (!all.length) return;
     const idset = new Set(all);
-    const E = [];
-    this.E.forEach((e) => {
-      if (e.hidden) return;
-      const s = e.data.source, t = e.data.target;
-      if (s !== t && idset.has(s) && idset.has(t)) E.push([s, t]);
-    });
+    const E = this._visibleEdges(all);
 
     const pos = this._layoutDagre(all, E, (id) => this.N.get(id), rankDir, nodeSep, rankSep);
     all.forEach((id) => { const n = this.N.get(id), p = pos.get(id); n.x = p.x; n.y = p.y; });
@@ -681,10 +722,16 @@ class GraphView {
   _visibleEdges(ids) {
     const idset = new Set(ids);
     const E = [];
+    const seen = new Set();
     this.E.forEach((e) => {
       if (e.hidden) return;
-      const s = e.data.source, t = e.data.target;
-      if (s !== t && idset.has(s) && idset.has(t)) E.push([s, t]);
+      const s = this._resolveId(e.data.source);
+      const t = this._resolveId(e.data.target);
+      if (s === t || !idset.has(s) || !idset.has(t)) return;
+      const key = s + '##' + t;
+      if (seen.has(key)) return;
+      seen.add(key);
+      E.push([s, t]);
     });
     return E;
   }

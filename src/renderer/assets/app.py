@@ -126,15 +126,17 @@ function updateFlowBtn() {
 function showPanel(data) {
   currentData = data;
   panel.classList.add('open');
-  panelTitle.textContent = data.qualified_name || data.name;
-  panelTitle.title = data.qualified_name || data.name;
+  const fileKey = data.relative_file || data.file || '';
+  const isSummaryNode = summaryOnly && proxyFileKey[data.id];
+  const title = isSummaryNode ? (fileKey || data.qualified_name || data.name) : (data.qualified_name || data.name);
+  panelTitle.textContent = title;
+  panelTitle.title = title;
 
   const isExternal = data.language === 'external';
   const badge = `<span class="lang-badge" style="background:${data.color}">${data.language}</span>`;
   const file = data.relative_file || data.file;
   const lines = `L${data.start_line}–${data.end_line}`;
 
-  const fileKey = data.relative_file || data.file || '';
   const fileSum = (GRAPH_DATA.fileSummaries && GRAPH_DATA.fileSummaries[fileKey]) ? GRAPH_DATA.fileSummaries[fileKey] : '';
   const safeFileSum = fileSum ? escapeHtml(fileSum) : '';
   const safeSummary = data.summary ? escapeHtml(data.summary) : '';
@@ -150,7 +152,7 @@ function showPanel(data) {
     ${data.class_name ? `<div class="info-row"><span class="info-label">Class</span><span class="info-val">${escapeHtml(data.class_name)}</span></div>` : ''}
     <div class="info-row"><span class="info-label">Flow</span><span class="info-val">${data.is_entrypoint ? '🟢 Entrypoint (flow root)' : 'depth ' + data.depth + ' from entrypoint'}</span></div>
     ${data.summary ? `<div class="info-row"><span class="info-label">Summary</span><span class="info-val">${safeSummary}</span></div>` : ''}
-    ${fileSum ? `<div class="info-row"><span class="info-label">File&nbsp;role</span><span class="info-val">${safeFileSum}</span></div>` : ''}
+    ${fileSum ? `<div class="info-row"><span class="info-label">${isSummaryNode ? 'Description' : 'File&nbsp;role'}</span><span class="info-val">${safeFileSum}</span></div>` : ''}
   `;
 
   // External nodes have no source; hide the source block entirely for them.
@@ -244,10 +246,126 @@ document.getElementById('btn-external').addEventListener('click', function () {
 // Toggle file-container grouping, then re-run the current layout.
 let groupByFile = true;
 document.getElementById('btn-group').addEventListener('click', function () {
+  if (summaryOnly) return;
   groupByFile = !groupByFile;
   this.classList.toggle('active', groupByFile);
   gv.setGrouping(groupByFile);
   applyLayout(document.getElementById('layout-select').value);
+});
+
+// ── Summary-only view (file blocks with LLM descriptions) ─────────────────
+// Collapses each summarized file to a single node showing its LLM description.
+// Cross-file call edges are preserved via per-file proxy nodes.
+const HAS_FILE_SUMMARIES = Object.keys(FILE_SUMMARIES).length > 0;
+const fileProxy = {};   // relative_file -> representative node id
+const proxyFileKey = {}; // node id -> relative_file
+const defaultLabelOf = (n) => (n.class_name ? n.class_name + '.' + n.name : n.name);
+
+function nodeFileKey(n) {
+  return n.language === 'external' ? null : (n.relative_file || n.file || null);
+}
+
+function wrapSummaryText(text, maxLen) {
+  const words = String(text || '').split(/\s+/);
+  const lines = [];
+  let line = '';
+  words.forEach((w) => {
+    const next = line ? line + ' ' + w : w;
+    if (next.length > maxLen && line) { lines.push(line); line = w; }
+    else line = next;
+  });
+  if (line) lines.push(line);
+  return lines.slice(0, 10).join('\n');
+}
+
+function summaryNodeLabel(fileKey) {
+  const base = fileKey.split('/').pop() || fileKey;
+  const sum = FILE_SUMMARIES[fileKey] || '';
+  return base + '\n' + wrapSummaryText(sum, 44);
+}
+
+if (HAS_FILE_SUMMARIES) {
+  const byFile = {};
+  GRAPH_DATA.nodes.forEach((n) => {
+    const k = nodeFileKey(n);
+    if (!k || !FILE_SUMMARIES[k]) return;
+    if (!byFile[k]) byFile[k] = [];
+    byFile[k].push(n);
+  });
+  Object.entries(byFile).forEach(([k, nodes]) => {
+    nodes.sort((a, b) => {
+      if (a.is_entrypoint !== b.is_entrypoint) return a.is_entrypoint ? -1 : 1;
+      if (a.depth !== b.depth) return a.depth - b.depth;
+      return (a.start_line || 0) - (b.start_line || 0);
+    });
+    fileProxy[k] = nodes[0].id;
+    proxyFileKey[nodes[0].id] = k;
+  });
+  document.getElementById('btn-summary').style.display = '';
+}
+
+let summaryOnly = false;
+const savedLabels = new Map();
+let savedGroupByFile = true;
+const SUMMARY_NODE_FILL = '#2a2a42';
+let savedFillOf = null;
+
+function applySummaryMode(on) {
+  summaryOnly = on;
+  const btn = document.getElementById('btn-summary');
+  const groupBtn = document.getElementById('btn-group');
+  btn.classList.toggle('active', on);
+  groupBtn.style.opacity = on ? '0.45' : '';
+  groupBtn.style.pointerEvents = on ? 'none' : '';
+
+  if (on) {
+    savedGroupByFile = groupByFile;
+    groupByFile = false;
+    gv.setGrouping(false);
+    gv.o.endpointOf = (id) => {
+      const n = nodeById[id];
+      if (!n) return id;
+      const k = nodeFileKey(n);
+      return (k && fileProxy[k]) ? fileProxy[k] : id;
+    };
+    savedFillOf = gv.o.fillOf;
+    gv.o.fillOf = (n) => (proxyFileKey[n.id] ? SUMMARY_NODE_FILL : (savedFillOf ? savedFillOf(n) : n.color));
+    gv.forEachNode((id, n) => {
+      if (n.language === 'external') return;
+      const k = nodeFileKey(n);
+      if (k && fileProxy[k]) {
+        if (id === fileProxy[k]) {
+          if (!savedLabels.has(id)) savedLabels.set(id, defaultLabelOf(n));
+          gv.setNodeLabel(id, summaryNodeLabel(k));
+          gv.nodeClass(id, 'summary-node', true);
+          gv.showNode(id, true);
+        } else {
+          gv.showNode(id, false);
+        }
+      }
+    });
+    gv._redraw();
+  } else {
+    gv.o.endpointOf = null;
+    if (savedFillOf) gv.o.fillOf = savedFillOf;
+    savedFillOf = null;
+    gv.forEachNode((id, n) => {
+      gv.nodeClass(id, 'summary-node', false);
+      if (savedLabels.has(id)) gv.setNodeLabel(id, savedLabels.get(id));
+      gv.showNode(id, true);
+    });
+    savedLabels.clear();
+    groupByFile = savedGroupByFile;
+    gv.setGrouping(groupByFile);
+    groupBtn.classList.toggle('active', groupByFile);
+    gv._redraw();
+  }
+  applyLayout(document.getElementById('layout-select').value);
+}
+
+document.getElementById('btn-summary').addEventListener('click', function () {
+  if (!HAS_FILE_SUMMARIES) return;
+  applySummaryMode(!summaryOnly);
 });
 
 // ── Flows: entrypoints + downstream isolation ─────────────────────────────
