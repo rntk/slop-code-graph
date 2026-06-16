@@ -38,3 +38,8 @@ Thumbs.db
 
 # Output files
 graph.html
+
+# Traverse
+.traverse-cache/
+frontend/node_modules/
+frontend/dist/

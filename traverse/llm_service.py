@@ -227,11 +227,14 @@ class FlowSummaryService:
             raise RuntimeError("LLM client not configured")
 
         user_prompt = _build_user_prompt(node, scoped.graph, reachable, bodies, truncated)
+        logger.info("LLM raw prompt (system):\n%s", SYSTEM_PROMPT)
+        logger.info("LLM raw prompt (user):\n%s", user_prompt)
         response = self._llm.complete(
             user_prompt=user_prompt,
             system_prompt=SYSTEM_PROMPT,
             temperature=0.1,
         )
+        logger.info("LLM raw response:\n%s", response.content)
         summary = (response.content or "").strip()
         if not summary:
             raise RuntimeError("LLM returned empty summary")
@@ -281,7 +284,9 @@ def _edge_labels_for_immediate(
     prompt = "\n".join(lines)
 
     try:
+        logger.info("LLM raw prompt (user):\n%s", prompt)
         resp = llm.complete(user_prompt=prompt, temperature=0.0)
+        logger.info("LLM raw response:\n%s", resp.content)
         content = (resp.content or "").strip()
         qname_to_edge_id: dict[str, str] = {}
         for t in targets:

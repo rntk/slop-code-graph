@@ -27,10 +27,10 @@ test:
 	pytest -v
 
 lint:
-	ruff check graph.py src/ tests/
+	ruff check graph.py src/ traverse/ llm/ tests/
 
 format:
-	ruff format --check graph.py src/ tests/
+	ruff format --check graph.py src/ traverse/ llm/ tests/
 
 fix:
 	ruff check --fix graph.py src/ tests/
@@ -50,3 +50,10 @@ docker-run:
 docker-dev:
 	docker build -f Dockerfile.dev -t callgraph-dev .
 	docker run --rm -it -v $(PWD):/app callgraph-dev bash
+
+docker-traverse-build:
+	docker build -f Dockerfile.traverse -t traverse .
+
+docker-traverse-run:
+	docker run --rm -it -p 8765:8765 -v $(PWD):/workspace -w /workspace traverse
+
