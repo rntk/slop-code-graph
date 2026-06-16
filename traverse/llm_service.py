@@ -21,6 +21,14 @@ SYSTEM_PROMPT = (
     "purpose and shape, not implementation minutiae. Be terse. Plain text only."
 )
 
+# Fixed prefix for edge-label requests so that the instruction tokens are stable
+# across calls (aids KV cache / prefix cache reuse on the LLM backend).
+EDGE_LABEL_SYSTEM_PROMPT = (
+    "You are a senior engineer. For each callee, reply with exactly one line in the form "
+    "'QUALIFIED_NAME: 3-6 word phrase' describing what the call from the origin to that "
+    "callee does in this specific flow. Be terse and specific. No extra text."
+)
+
 
 def _outgoing_map(graph: CallGraph) -> dict[str, list[str]]:
     outgoing: dict[str, list[str]] = {}
@@ -135,13 +143,18 @@ def _build_user_prompt(
     truncated: bool,
 ) -> str:
     lines: list[str] = []
-    lines.append("Describe the flow starting at this node:")
+    # Put fixed instructional text first so that the token prefix is identical
+    # for all flow-summary requests (enables KV/prefix cache reuse on backends
+    # that support cache_prompt or equivalent).
+    lines.append("Describe the flow starting at the entry point below. Focus on purpose and shape.")
+    lines.append("")
+    lines.append("Entry point:")
     lines.append(
         f"  {start.qualified_name} in {start.relative_file} "
         f"(lines {start.start_line}-{start.end_line})"
     )
     lines.append("")
-    lines.append("Subgraph edges (caller -> callee):")
+    lines.append("Subgraph edges (caller -> callee) within the view:")
     body_ids = {n.id for n in bodies}
     for edge in graph.edges:
         if edge.source in body_ids and edge.target in body_ids:
@@ -153,6 +166,8 @@ def _build_user_prompt(
     if truncated:
         lines.append("Note: some downstream function bodies were omitted due to size budget.")
         lines.append("")
+    lines.append("Source of functions in the flow (roughly in call order):")
+    lines.append("")
     for node in bodies:
         cls = f"{node.class_name}." if node.class_name else ""
         lines.append(
@@ -270,22 +285,20 @@ def _edge_labels_for_immediate(
     if not targets:
         return {}
 
+    # Use a dedicated stable system prompt (instructions) and put variable data
+    # (origin + callees) in the user prompt. This gives a long fixed prefix for
+    # KV cache reuse on all edge-label requests.
     lines: list[str] = []
-    lines.append(
-        "For each callee, reply with exactly one line in the form 'QUALIFIED_NAME: 3-6 word phrase' "
-        "describing what the call from the origin to that callee does in this specific flow. "
-        "Be terse and specific. No extra text."
-    )
-    lines.append("")
     lines.append(f"Origin: {start.qualified_name}")
     lines.append("Callees:")
     for t in targets:
         lines.append(f"- {t.qualified_name}")
-    prompt = "\n".join(lines)
+    user_prompt = "\n".join(lines)
 
     try:
-        logger.info("LLM raw prompt (user):\n%s", prompt)
-        resp = llm.complete(user_prompt=prompt, temperature=0.0)
+        logger.info("LLM raw prompt (system):\n%s", EDGE_LABEL_SYSTEM_PROMPT)
+        logger.info("LLM raw prompt (user):\n%s", user_prompt)
+        resp = llm.complete(user_prompt=user_prompt, system_prompt=EDGE_LABEL_SYSTEM_PROMPT, temperature=0.0)
         logger.info("LLM raw response:\n%s", resp.content)
         content = (resp.content or "").strip()
         qname_to_edge_id: dict[str, str] = {}

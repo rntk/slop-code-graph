@@ -184,7 +184,14 @@ def _build_file_summaries(graph: CallGraph, llm, cache_dir: Path | None = None) 
         if not snippet:
             continue
 
-        user_prompt = f"FILE: {rel}\n\nFunctions from this file that appear in the flow:\n{snippet}\n\nBrief summary of this file's role:"
+        # Start the user prompt with a stable instruction prefix so all
+        # per-file summary requests share the same leading tokens after the
+        # (also stable) system prompt. This improves KV/prefix cache hit rate.
+        user_prompt = (
+            "Brief summary of this file's role in the flow:\n\n"
+            f"FILE: {rel}\n\n"
+            f"Functions from this file that appear in the flow:\n{snippet}"
+        )
 
         # Generate a stable hash-based key for the cache using both prompts
         prompt_key = hashlib.sha256(
