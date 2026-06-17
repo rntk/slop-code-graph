@@ -58,12 +58,29 @@ CANVAS_STYLE = """
 
 /* ── Scroll area + positioned stage ─────────────────────────────────────── */
 #canvas-scroll {
-  flex: 1; min-height: 0; overflow: auto; position: relative;
-  background:
-    radial-gradient(circle, #2a2a40 1px, transparent 1px);
-  background-size: 28px 28px;
+  flex: 1; min-height: 0; overflow: hidden; position: relative;
+  background-color: #1e1e1e;
+  background-image: radial-gradient(circle, #2a2a40 1px, transparent 1px);
+  background-size: calc(28px * var(--canvas-scale, 1)) calc(28px * var(--canvas-scale, 1));
+  background-position: var(--canvas-translate-x, 40px) var(--canvas-translate-y, 40px);
+  user-select: none;
+  cursor: grab;
 }
-#canvas-stage { position: relative; }
+#canvas-scroll.is-dragging {
+  cursor: grabbing !important;
+}
+body.canvas-global-dragging,
+body.canvas-global-dragging * {
+  cursor: grabbing !important;
+}
+#canvas-stage {
+  position: absolute;
+  transform-origin: 0 0;
+  transform: translate(var(--canvas-translate-x, 40px), var(--canvas-translate-y, 40px)) scale(var(--canvas-scale, 1));
+}
+#canvas-stage.is-focusing-highlight {
+  transition: transform 320ms ease;
+}
 
 /* ── Left topic rail: cards are absolutely positioned & level-columned ───── */
 .cv-card {
@@ -85,9 +102,38 @@ CANVAS_STYLE = """
 }
 .cv-card.is-selected { border-color: #ffffff; }
 .cv-card--root { background: #2a2a32; }
+
+.cv-card-content {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+
+  --_lh: var(--topic-card-label-height, 50px);
+  --_p: 6px;
+  --_vis-top: max(
+    0px,
+    calc(-1 * var(--canvas-translate-y) / var(--canvas-scale) - var(--topic-card-top))
+  );
+  --_vis-bot: min(
+    var(--topic-card-height),
+    calc(
+      (var(--canvas-area-height, 100px) - var(--canvas-translate-y)) / var(--canvas-scale) -
+        var(--topic-card-top)
+    )
+  );
+  --_vis-center: calc((var(--_vis-top) + var(--_vis-bot)) / 2);
+  --_offset: clamp(
+    calc(var(--_lh) / 2 + var(--_p) - var(--topic-card-height) / 2),
+    calc(var(--_vis-center) - var(--topic-card-height) / 2),
+    calc(var(--topic-card-height) / 2 - var(--_lh) / 2 - var(--_p))
+  );
+
+  transform: translateY(var(--_offset));
+}
+
 .cv-card-name {
-  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2;
-  overflow: hidden; font-size: 12px; font-weight: 700; line-height: 1.2; color: #e8eaf4;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: var(--topic-card-title-line-clamp, 2); line-clamp: var(--topic-card-title-line-clamp, 2);
+  overflow: hidden; font-size: var(--topic-card-title-font-size, 12px); font-weight: 700; line-height: 1.2; color: #e8eaf4;
 }
 .cv-card-meta {
   font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: #888;
@@ -142,6 +188,72 @@ CANVAS_STYLE = """
 .cv-side-body pre .is-header { color: #6a9955; font-weight: 700; }
 
 #canvas-empty { padding: 28px; color: #888; font-style: italic; }
+
+/* ── Zoom controls (floating) ───────────────────────────────────────────── */
+.canvas-controls {
+  position: absolute;
+  bottom: 20px;
+  right: 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  z-index: 10;
+}
+.canvas-controls.is-horizontal {
+  flex-direction: row;
+  align-items: flex-end;
+}
+.canvas-controls-header {
+  display: flex;
+  flex-direction: row-reverse;
+  gap: 4px;
+}
+.canvas-controls.is-horizontal .canvas-controls-header {
+  flex-direction: column;
+}
+.canvas-controls-body {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+}
+.canvas-controls.is-horizontal .canvas-controls-body {
+  flex-direction: row;
+  align-items: flex-end;
+}
+.canvas-controls.is-folded .canvas-controls-body {
+  display: none;
+}
+.canvas-zoom-btn {
+  width: 32px;
+  height: 32px;
+  background: rgba(37, 37, 38, 0.85);
+  backdrop-filter: blur(14px);
+  border: 1px solid #3c3c3c;
+  border-radius: 4px;
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #ccc;
+  transition: background 0.15s, color 0.15s;
+}
+.canvas-zoom-btn:hover {
+  background: #007acc;
+  color: #fff;
+  border-color: #007acc;
+}
+.canvas-spacer {
+  height: 4px;
+}
+.canvas-controls.is-horizontal .canvas-spacer {
+  width: 4px;
+  height: auto;
+}
 """
 
 CANVAS_SCRIPT = r"""
@@ -164,6 +276,131 @@ CANVAS_SCRIPT = r"""
   var topics = [], lines = [], lineMeta = [];
   var lineEls = [];            // span per source line (code mode)
   var sumCardEls = {};         // leaf path -> summary card element (summary mode)
+
+  // ── Zoom/Pan State ──────────────────────────────────────────────────────
+  var scale = 1.0, translateX = 40, translateY = 40;
+  var isDragging = false;
+  var lastMouseX = 0, lastMouseY = 0;
+  var userMoved = false;
+
+  // ── Ported Dense Card Collision and Layout Resolution ───────────────────
+  function cardsOverlapVertically(topCard, bottomCard) {
+    return (
+      topCard.top + topCard.height + CARD_GAP > bottomCard.top &&
+      bottomCard.top + bottomCard.height + CARD_GAP > topCard.top
+    );
+  }
+
+  function getCompactCardHeight(card, isCrowded) {
+    var height = card.height || CARD_MIN_H;
+    if (!isCrowded || height > 96) return height;
+    return Math.max(CARD_MIN_H, height - 16);
+  }
+
+  function nudgeCrowdedPair(topCard, bottomCard) {
+    var overlap = topCard.top + topCard.height + CARD_GAP - bottomCard.top;
+    if (overlap <= 0) return;
+
+    var remaining = overlap;
+    var topMin = Math.max(0, topCard.originalTop - 18);
+    var bottomMax = bottomCard.originalTop + 18;
+
+    var topMove = Math.min(remaining / 2, Math.max(0, topCard.top - topMin));
+    topCard.top -= topMove;
+    remaining -= topMove;
+
+    var bottomMove = Math.min(remaining, Math.max(0, bottomMax - bottomCard.top));
+    bottomCard.top += bottomMove;
+  }
+
+  function getDenseCardZIndex(card, isCrowded) {
+    if (!isCrowded) return 1;
+    return 20 + Math.max(0, 10 - Math.min(card.unitCount || 0, 10));
+  }
+
+  function adjustCrowdedLevelCards(levelCards) {
+    var sortedCards = levelCards.slice().sort(function (left, right) {
+      return left.top - right.top || left.path.localeCompare(right.path);
+    });
+
+    var workingCards = sortedCards.map(function (card, index) {
+      var previousCard = sortedCards[index - 1];
+      var nextCard = sortedCards[index + 1];
+      var isCrowded =
+        (previousCard && cardsOverlapVertically(previousCard, card)) ||
+        (nextCard && cardsOverlapVertically(card, nextCard));
+      var height = getCompactCardHeight(card, isCrowded);
+
+      return {
+        path: card.path,
+        name: card.name,
+        depth: card.depth,
+        rootName: card.rootName,
+        unitCount: card.unitCount,
+        startUnit: card.startUnit,
+        top: card.top || 0,
+        height: height,
+        originalTop: card.top || 0,
+        isCrowded: isCrowded
+      };
+    });
+
+    for (var pass = 0; pass < 3; pass++) {
+      for (var index = 1; index < workingCards.length; index++) {
+        nudgeCrowdedPair(workingCards[index - 1], workingCards[index]);
+      }
+      for (var index = workingCards.length - 2; index >= 0; index--) {
+        nudgeCrowdedPair(workingCards[index], workingCards[index + 1]);
+      }
+    }
+
+    return workingCards.map(function (card) {
+      return {
+        path: card.path,
+        name: card.name,
+        depth: card.depth,
+        rootName: card.rootName,
+        unitCount: card.unitCount,
+        startUnit: card.startUnit,
+        top: Math.round(card.top),
+        height: Math.round(card.height),
+        zIndex: getDenseCardZIndex(card, card.isCrowded)
+      };
+    });
+  }
+
+  function getAdjustedHierarchyCards(cards) {
+    var cardsByLevel = new Map();
+    cards.forEach(function (card) {
+      var levelCards = cardsByLevel.get(card.depth) || [];
+      levelCards.push(card);
+      cardsByLevel.set(card.depth, levelCards);
+    });
+
+    var out = [];
+    cardsByLevel.forEach(function (levelCards) {
+      var adjusted = adjustCrowdedLevelCards(levelCards);
+      adjusted.forEach(function (c) { out.push(c); });
+    });
+
+    return out.sort(function (left, right) {
+      return (
+        left.depth - right.depth ||
+        left.top - right.top ||
+        left.path.localeCompare(right.path)
+      );
+    });
+  }
+
+  function getTitleLineBudget(h) {
+    return h < 88 ? 1 : 2;
+  }
+  
+  function getCardLabelHeight(height, fontSize) {
+    var titleLines = getTitleLineBudget(height);
+    var titleHeight = fontSize * 1.2 * titleLines;
+    return Math.ceil(titleHeight + 3 + 12);
+  }
 
   // ── Topic-path helpers (port of splitTopicPath / color utils) ────────────
   function splitPath(name) {
@@ -245,29 +482,48 @@ CANVAS_SCRIPT = r"""
         top: top, height: Math.max(CARD_MIN_H, bottom - top),
       };
     });
-    return resolveColumnOverlaps(cards);
+    return getAdjustedHierarchyCards(cards);
   }
 
-  // Port of resolveColumnOverlaps: within a level column, stack with no overlap.
-  function resolveColumnOverlaps(cards) {
-    var byLevel = new Map();
-    cards.forEach(function (c) { (byLevel.get(c.depth) || byLevel.set(c.depth, []).get(c.depth)).push(c); });
-    byLevel.forEach(function (group) {
-      group.sort(function (a, b) { return a.startUnit - b.startUnit || a.top - b.top || a.path.localeCompare(b.path); });
-      var prevBottom = -Infinity;
-      group.forEach(function (c, i) {
-        var top = Math.max(c.top, prevBottom + CARD_GAP);
-        var bottom = Math.max(top + c.height, top + CARD_MIN_H);
-        var next = group[i + 1];
-        if (next && next.top - CARD_GAP >= top + CARD_MIN_H) bottom = Math.min(bottom, next.top - CARD_GAP);
-        c.top = top; c.height = bottom - top; prevBottom = bottom;
-      });
+  // In summary mode, position rail cards from measured summary-card rects.
+  function measureSummaryMetrics() {
+    // Returns node.path -> {top, bottom}; leaves from their own card, parents aggregate.
+    var leafRect = {};
+    var col = document.getElementById('canvas-summary-col');
+    var base = col ? col.offsetTop : 0;
+    Object.keys(sumCardEls).forEach(function (p) {
+      var el = sumCardEls[p];
+      leafRect[p] = { top: base + el.offsetTop, bottom: base + el.offsetTop + el.offsetHeight };
     });
-    return cards;
+    return leafRect;
+  }
+
+  function layoutCardsSummary() {
+    var leafRect = measureSummaryMetrics();
+    var nodes = nodesUpToLevel(tree.root, selectedLevel);
+    var cards = nodes.map(function (n) {
+      var tops = [], bots = [];
+      Object.keys(leafRect).forEach(function (p) {
+        if (p === n.path || p.indexOf(n.path + ' > ') === 0 || n.path.indexOf(p + ' > ') === 0) {
+          tops.push(leafRect[p].top); bots.push(leafRect[p].bottom);
+        }
+      });
+      var top = tops.length ? Math.min.apply(null, tops) : STAGE_PAD_TOP;
+      var bottom = bots.length ? Math.max.apply(null, bots) : top + CARD_MIN_H;
+      return {
+        path: n.path, name: n.name, depth: n.depth, rootName: splitPath(n.path)[0] || n.name,
+        unitCount: n.units.size, startUnit: Array.from(n.units).sort(function (a, b) { return a - b; })[0] || 0,
+        top: top, height: Math.max(CARD_MIN_H, bottom - top),
+      };
+    });
+    return getAdjustedHierarchyCards(cards);
   }
 
   // ── Renderers ────────────────────────────────────────────────────────────
-  function railWidth() { return RAIL_PADDING * 2 + (selectedLevel + 1) * CARD_W + selectedLevel * COL_GAP; }
+  function railWidth() {
+    var currentCardW = CARD_W * Math.max(1, 1 / scale);
+    return RAIL_PADDING * 2 + (selectedLevel + 1) * currentCardW + selectedLevel * COL_GAP;
+  }
 
   function renderRail(cards) {
     var rail = document.getElementById('canvas-rail');
@@ -276,15 +532,31 @@ CANVAS_SCRIPT = r"""
       var el = document.createElement('div');
       el.className = 'cv-card' + (c.depth === 0 ? ' cv-card--root' : '')
         + (activePath === c.path ? ' is-active' : '') + (selectedPath === c.path ? ' is-selected' : '');
-      el.style.left = (RAIL_PADDING + c.depth * (CARD_W + COL_GAP)) + 'px';
       el.style.top = c.top + 'px';
       el.style.height = c.height + 'px';
-      el.style.setProperty('--cv-card-w', CARD_W + 'px');
+      el.style.setProperty('--topic-card-top', c.top + 'px');
+      el.style.setProperty('--topic-card-height', c.height + 'px');
       el.style.setProperty('--cv-accent', accentColor(c.rootName, c.depth));
       el.setAttribute('data-path', c.path);
-      var name = document.createElement('span'); name.className = 'cv-card-name'; name.textContent = c.name;
-      var meta = document.createElement('span'); meta.className = 'cv-card-meta'; meta.textContent = c.unitCount + ' lines';
-      el.appendChild(name); el.appendChild(meta);
+      el.setAttribute('data-depth', c.depth);
+      el.setAttribute('data-height', c.height);
+      el.style.zIndex = c.zIndex || (c.depth === 0 ? 10 : 5);
+      
+      var content = document.createElement('div');
+      content.className = 'cv-card-content';
+      
+      var name = document.createElement('span');
+      name.className = 'cv-card-name';
+      name.textContent = c.name;
+      
+      var meta = document.createElement('span');
+      meta.className = 'cv-card-meta';
+      meta.textContent = c.unitCount + ' lines';
+      
+      content.appendChild(name);
+      content.appendChild(meta);
+      el.appendChild(content);
+      
       bindCard(el, c.path);
       rail.appendChild(el);
     });
@@ -292,7 +564,7 @@ CANVAS_SCRIPT = r"""
 
   function renderCode() {
     var col = document.getElementById('canvas-code-col');
-    col.style.display = ''; col.style.left = (railWidth() + COL_PAD) + 'px'; col.style.width = CODE_W + 'px';
+    col.style.display = '';
     var pre = document.getElementById('canvas-code');
     pre.innerHTML = '';
     lineEls = [];
@@ -339,7 +611,7 @@ CANVAS_SCRIPT = r"""
 
   function renderSummaries() {
     var col = document.getElementById('canvas-summary-col');
-    col.style.display = ''; col.style.left = (railWidth() + COL_PAD) + 'px'; col.style.width = CODE_W + 'px';
+    col.style.display = '';
     col.innerHTML = '';
     sumCardEls = {};
     frontierNodes().forEach(function (node) {
@@ -365,45 +637,10 @@ CANVAS_SCRIPT = r"""
     document.getElementById('canvas-code-col').style.display = 'none';
   }
 
-  // In summary mode, position rail cards from measured summary-card rects.
-  function measureSummaryMetrics() {
-    // Returns node.path -> {top, bottom}; leaves from their own card, parents aggregate.
-    var leafRect = {};
-    var col = document.getElementById('canvas-summary-col');
-    var base = col ? col.offsetTop : 0;
-    Object.keys(sumCardEls).forEach(function (p) {
-      var el = sumCardEls[p];
-      leafRect[p] = { top: base + el.offsetTop, bottom: base + el.offsetTop + el.offsetHeight };
-    });
-    return leafRect;
-  }
-
-  function layoutCardsSummary() {
-    var leafRect = measureSummaryMetrics();
-    var nodes = nodesUpToLevel(tree.root, selectedLevel);
-    var cards = nodes.map(function (n) {
-      var tops = [], bots = [];
-      Object.keys(leafRect).forEach(function (p) {
-        if (p === n.path || p.indexOf(n.path + ' > ') === 0 || n.path.indexOf(p + ' > ') === 0) {
-          tops.push(leafRect[p].top); bots.push(leafRect[p].bottom);
-        }
-      });
-      var top = tops.length ? Math.min.apply(null, tops) : STAGE_PAD_TOP;
-      var bottom = bots.length ? Math.max.apply(null, bots) : top + CARD_MIN_H;
-      return {
-        path: n.path, name: n.name, depth: n.depth, rootName: splitPath(n.path)[0] || n.name,
-        unitCount: n.units.size, startUnit: Array.from(n.units).sort(function (a, b) { return a - b; })[0] || 0,
-        top: top, height: Math.max(CARD_MIN_H, bottom - top),
-      };
-    });
-    return resolveColumnOverlaps(cards);
-  }
-
   // ── Side card (right): summary (code mode) or source code (summary mode) ──
   function renderSideCard(cardTopMap) {
     var col = document.getElementById('canvas-side-col');
     col.innerHTML = '';
-    col.style.left = (railWidth() + COL_PAD + CODE_W + COL_PAD) + 'px';
     if (!activePath) return;
     var node = tree.byPath.get(activePath);
     if (!node) return;
@@ -478,6 +715,12 @@ CANVAS_SCRIPT = r"""
     renderSideCard(lastCardTops);
     scrollToActive();
   }
+  function setActiveNoScroll(path) {
+    activePath = path;
+    refreshActiveClasses();
+    applyHighlight();
+    renderSideCard(lastCardTops);
+  }
   function refreshActiveClasses() {
     var rail = document.getElementById('canvas-rail');
     Array.prototype.forEach.call(rail.querySelectorAll('.cv-card'), function (el) {
@@ -494,33 +737,282 @@ CANVAS_SCRIPT = r"""
     var top = lastCardTops && lastCardTops[activePath];
     if (top == null) return;
     var scroll = document.getElementById('canvas-scroll');
-    if (top < scroll.scrollTop + 40 || top > scroll.scrollTop + scroll.clientHeight - 80) {
-      scroll.scrollTo({ top: Math.max(0, top - 80), behavior: 'smooth' });
-    }
+    var wrapHeight = scroll.clientHeight;
+    var localTargetY = top;
+    var nextY = wrapHeight * 0.2 - localTargetY * scale;
+    animateTransform(scale, translateX, nextY);
   }
   function bindCard(el, path) {
-    el.addEventListener('mouseenter', function () { if (!selectedPath) setActive(path); });
-    el.addEventListener('mouseleave', function () { if (!selectedPath) setActive(null); });
+    el.addEventListener('mouseenter', function () { if (!selectedPath) setActiveNoScroll(path); });
+    el.addEventListener('mouseleave', function () { if (!selectedPath) setActiveNoScroll(null); });
     el.addEventListener('click', function () {
       if (selectedPath === path) { selectedPath = null; setActive(null); }
       else { selectedPath = path; setActive(path); }
     });
   }
   function bindSummaryCard(el, path) {
-    el.addEventListener('mouseenter', function () { if (!selectedPath) setActive(path); });
-    el.addEventListener('mouseleave', function () { if (!selectedPath) setActive(null); });
+    el.addEventListener('mouseenter', function () { if (!selectedPath) setActiveNoScroll(path); });
+    el.addEventListener('mouseleave', function () { if (!selectedPath) setActiveNoScroll(null); });
     el.addEventListener('click', function () {
       if (selectedPath === path) { selectedPath = null; setActive(null); }
       else { selectedPath = path; setActive(path); }
     });
   }
 
+  // ── Zoom/Pan Transform application ──────────────────────────────────────────
+  function setTransform(nextScale, nextX, nextY) {
+    scale = nextScale;
+    translateX = nextX;
+    translateY = nextY;
+
+    var scroll = document.getElementById('canvas-scroll');
+    var stage = document.getElementById('canvas-stage');
+    if (!scroll || !stage) return;
+    
+    scroll.style.setProperty('--canvas-translate-x', translateX + 'px');
+    scroll.style.setProperty('--canvas-translate-y', translateY + 'px');
+    scroll.style.setProperty('--canvas-scale', scale);
+
+    stage.style.transform = 'translate(' + translateX + 'px, ' + translateY + 'px) scale(' + scale + ')';
+    
+    updateZoomDependentStyles();
+  }
+
+  function animateTransform(nextScale, nextX, nextY) {
+    var stage = document.getElementById('canvas-stage');
+    if (!stage) return;
+    stage.classList.add('is-focusing-highlight');
+    setTransform(nextScale, nextX, nextY);
+    setTimeout(function () {
+      stage.classList.remove('is-focusing-highlight');
+    }, 380);
+  }
+
+  function updateAreaHeight() {
+    var scroll = document.getElementById('canvas-scroll');
+    if (scroll) {
+      scroll.style.setProperty('--canvas-area-height', scroll.clientHeight + 'px');
+    }
+  }
+
+  function updateZoomDependentStyles() {
+    var currentCardW = CARD_W * Math.max(1, 1 / scale);
+    
+    var rail = document.getElementById('canvas-rail');
+    if (rail) {
+      var cardEls = rail.querySelectorAll('.cv-card');
+      cardEls.forEach(function (el) {
+        var depth = parseInt(el.getAttribute('data-depth') || '0', 10);
+        var height = parseFloat(el.getAttribute('data-height') || '0');
+        
+        el.style.left = (RAIL_PADDING + depth * (currentCardW + COL_GAP)) + 'px';
+        el.style.setProperty('--cv-card-w', currentCardW + 'px');
+        
+        var zoomAdjustedFontSize = 12 * Math.max(1, 1.25 / scale - 0.25);
+        var titleLines = getTitleLineBudget(height);
+        var availableTitleHeight = Math.max(1, height - 16 - 12 - 3);
+        var heightCapped = availableTitleHeight / (1.2 * titleLines);
+        var fontSize = Math.max(1, Math.min(zoomAdjustedFontSize, heightCapped));
+        
+        el.style.setProperty('--topic-card-title-font-size', fontSize + 'px');
+        el.style.setProperty('--topic-card-title-line-clamp', titleLines);
+        el.style.setProperty('--topic-card-label-height', getCardLabelHeight(height, fontSize) + 'px');
+      });
+    }
+
+    var rw = RAIL_PADDING * 2 + (selectedLevel + 1) * currentCardW + selectedLevel * COL_GAP;
+    
+    var codeCol = document.getElementById('canvas-code-col');
+    if (codeCol) {
+      codeCol.style.left = (rw + COL_PAD) + 'px';
+      codeCol.style.width = CODE_W + 'px';
+    }
+    
+    var sumCol = document.getElementById('canvas-summary-col');
+    if (sumCol) {
+      sumCol.style.left = (rw + COL_PAD) + 'px';
+      sumCol.style.width = CODE_W + 'px';
+    }
+    
+    var sideCol = document.getElementById('canvas-side-col');
+    if (sideCol) {
+      sideCol.style.left = (rw + COL_PAD + CODE_W + COL_PAD) + 'px';
+    }
+    
+    var stage = document.getElementById('canvas-stage');
+    if (stage) {
+      stage.style.minWidth = (rw + COL_PAD + CODE_W + COL_PAD + SIDE_W + COL_PAD) + 'px';
+      
+      var contentCol = document.getElementById(summaryMode ? 'canvas-summary-col' : 'canvas-code-col');
+      var railH = 0;
+      if (rail) {
+        var cardEls = rail.querySelectorAll('.cv-card');
+        cardEls.forEach(function (el) {
+          var top = parseFloat(el.style.top || '0');
+          var height = parseFloat(el.style.height || '0');
+          if (top + height > railH) railH = top + height;
+        });
+      }
+      var contentH = contentCol ? contentCol.offsetTop + contentCol.offsetHeight : 0;
+      stage.style.height = (Math.max(railH, contentH) + STAGE_PAD_TOP + 40) + 'px';
+    }
+  }
+
+  function bindDragAndZoom() {
+    var scrollEl = document.getElementById('canvas-scroll');
+    if (!scrollEl) return;
+    
+    scrollEl.addEventListener('mousedown', function (e) {
+      if (e.target.closest('button, select, input, a, .cv-card, .cv-sum-card')) return;
+      if (e.button !== 0) return;
+      
+      isDragging = true;
+      userMoved = true;
+      scrollEl.classList.add('is-dragging');
+      lastMouseX = e.clientX;
+      lastMouseY = e.clientY;
+      
+      e.preventDefault();
+      
+      function onMouseMove(mv) {
+        if (!isDragging) return;
+        var dx = mv.clientX - lastMouseX;
+        var dy = mv.clientY - lastMouseY;
+        lastMouseX = mv.clientX;
+        lastMouseY = mv.clientY;
+        
+        setTransform(scale, translateX + dx, translateY + dy);
+      }
+      
+      function onMouseUp() {
+        isDragging = false;
+        scrollEl.classList.remove('is-dragging');
+        window.removeEventListener('mousemove', onMouseMove);
+        window.removeEventListener('mouseup', onMouseUp);
+      }
+      
+      window.addEventListener('mousemove', onMouseMove);
+      window.addEventListener('mouseup', onMouseUp);
+    });
+    
+    scrollEl.addEventListener('wheel', function (e) {
+      e.preventDefault();
+      var currentScale = scale;
+      var delta = e.deltaY > 0 ? 1 / 1.12 : 1.12;
+      var nextScale = Math.min(3.0, Math.max(0.3, currentScale * delta));
+      if (nextScale === currentScale) return;
+      
+      var wrapRect = scrollEl.getBoundingClientRect();
+      var cursorX = e.clientX - wrapRect.left;
+      var cursorY = e.clientY - wrapRect.top;
+      
+      var cx = (cursorX - translateX) / currentScale;
+      var cy = (cursorY - translateY) / currentScale;
+      
+      var nextX = cursorX - cx * nextScale;
+      var nextY = cursorY - cy * nextScale;
+      
+      userMoved = true;
+      setTransform(nextScale, nextX, nextY);
+    }, { passive: false });
+    
+    document.getElementById('cv-zoom-in').addEventListener('click', function () {
+      animateTransform(Math.min(3.0, scale * 1.2), translateX, translateY);
+    });
+    document.getElementById('cv-zoom-out').addEventListener('click', function () {
+      animateTransform(Math.max(0.3, scale / 1.2), translateX, translateY);
+    });
+    document.getElementById('cv-zoom-reset').addEventListener('click', function () {
+      animateTransform(1.0, 40, 40);
+    });
+    
+    var ARROW_STEP = 80;
+    document.getElementById('cv-nav-top').addEventListener('click', function () {
+      animateTransform(scale, translateX, 40);
+    });
+    document.getElementById('cv-nav-prev').addEventListener('click', function () {
+      var pageStep = Math.max(120, scrollEl.clientHeight * 0.8);
+      animateTransform(scale, translateX, translateY + pageStep);
+    });
+    document.getElementById('cv-nav-next').addEventListener('click', function () {
+      var pageStep = Math.max(120, scrollEl.clientHeight * 0.8);
+      animateTransform(scale, translateX, translateY - pageStep);
+    });
+    document.getElementById('cv-nav-bot').addEventListener('click', function () {
+      var stage = document.getElementById('canvas-stage');
+      var nextY = Math.min(40, scrollEl.clientHeight - stage.offsetHeight * scale - 40);
+      animateTransform(scale, translateX, nextY);
+    });
+    
+    var foldBtn = document.getElementById('cv-fold-btn');
+    var controls = document.getElementById('canvas-controls');
+    foldBtn.addEventListener('click', function () {
+      var isFolded = controls.classList.contains('is-folded');
+      controls.classList.toggle('is-folded', !isFolded);
+      foldBtn.textContent = isFolded ? '⊟' : '⊞';
+      foldBtn.title = isFolded ? 'Collapse controls' : 'Expand controls';
+    });
+    
+    var orientBtn = document.getElementById('cv-orient-btn');
+    orientBtn.addEventListener('click', function () {
+      var isHorizontal = controls.classList.contains('is-horizontal');
+      controls.classList.toggle('is-horizontal', !isHorizontal);
+      orientBtn.textContent = isHorizontal ? '⬌' : '⬍';
+      orientBtn.title = isHorizontal ? 'Switch to vertical' : 'Switch to horizontal';
+    });
+
+    window.addEventListener('keydown', function (e) {
+      if (!built) return;
+      var canvasView = document.getElementById('canvas-view');
+      if (!canvasView || canvasView.style.display === 'none') return;
+      
+      var t = e.target;
+      var tag = t ? t.tagName : '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (t && t.isContentEditable)) {
+        return;
+      }
+      
+      if (e.key === 'Home') {
+        e.preventDefault();
+        animateTransform(scale, translateX, 40);
+      } else if (e.key === 'End') {
+        e.preventDefault();
+        var stage = document.getElementById('canvas-stage');
+        var nextY = Math.min(40, scrollEl.clientHeight - stage.offsetHeight * scale - 40);
+        animateTransform(scale, translateX, nextY);
+      } else if (e.key === 'PageUp') {
+        e.preventDefault();
+        var pageStep = Math.max(120, scrollEl.clientHeight * 0.8);
+        animateTransform(scale, translateX, translateY + pageStep);
+      } else if (e.key === 'PageDown') {
+        e.preventDefault();
+        var pageStep = Math.max(120, scrollEl.clientHeight * 0.8);
+        animateTransform(scale, translateX, translateY - pageStep);
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setTransform(scale, translateX, translateY + ARROW_STEP);
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setTransform(scale, translateX, translateY - ARROW_STEP);
+      } else if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        setTransform(scale, translateX + ARROW_STEP, translateY);
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        setTransform(scale, translateX - ARROW_STEP, translateY);
+      } else if (e.key === '+' || e.key === '=') {
+        e.preventDefault();
+        animateTransform(Math.min(3.0, scale * 1.2), translateX, translateY);
+      } else if (e.key === '-' || e.key === '_') {
+        e.preventDefault();
+        animateTransform(Math.max(0.3, scale / 1.2), translateX, translateY);
+      }
+    });
+  }
+
   // ── Full (re)layout pass ──────────────────────────────────────────────────
   var tree = null, lastCardTops = {};
   function relayout() {
-    var stage = document.getElementById('canvas-stage');
-    stage.style.minWidth = (railWidth() + COL_PAD + CODE_W + COL_PAD + SIDE_W + COL_PAD) + 'px';
-
     if (summaryMode) renderSummaries(); else renderCode();
 
     // Measure after the content column has laid out, then position rail/side.
@@ -531,11 +1023,7 @@ CANVAS_SCRIPT = r"""
       renderRail(cards);
       renderSideCard(lastCardTops);
       applyHighlight();
-      // Stage height = tallest column.
-      var contentCol = document.getElementById(summaryMode ? 'canvas-summary-col' : 'canvas-code-col');
-      var railH = cards.reduce(function (m, c) { return Math.max(m, c.top + c.height); }, 0);
-      var contentH = contentCol ? contentCol.offsetTop + contentCol.offsetHeight : 0;
-      stage.style.height = (Math.max(railH, contentH) + STAGE_PAD_TOP + 40) + 'px';
+      updateZoomDependentStyles();
     });
   }
 
@@ -564,14 +1052,31 @@ CANVAS_SCRIPT = r"""
       + '<span class="cv-label">Level</span><span id="canvas-levels" class="cv-levels"></span>'
       + '<button id="canvas-mode-toggle">Show summaries</button>'
       + '<span class="cv-spacer"></span>'
-      + '<span class="cv-hint">hover a topic to align &amp; highlight · click to pin</span>'
+      + '<span class="cv-hint">drag to pan · wheel to zoom · hover to align</span>'
       + '</div>'
       + '<div id="canvas-scroll"><div id="canvas-stage">'
       + '<div id="canvas-rail"></div>'
       + '<div id="canvas-code-col"><pre id="canvas-code"></pre></div>'
       + '<div id="canvas-summary-col"></div>'
       + '<div id="canvas-side-col"></div>'
-      + '</div></div>';
+      + '</div>'
+      + '<div id="canvas-controls" class="canvas-controls">'
+      + '  <div class="canvas-controls-header">'
+      + '    <button type="button" class="canvas-zoom-btn" id="cv-fold-btn" title="Collapse controls">⊟</button>'
+      + '    <button type="button" class="canvas-zoom-btn" id="cv-orient-btn" title="Switch layout">⬌</button>'
+      + '  </div>'
+      + '  <div class="canvas-controls-body" id="cv-controls-body">'
+      + '    <button type="button" class="canvas-zoom-btn" id="cv-nav-top" title="Scroll to top">⇈</button>'
+      + '    <button type="button" class="canvas-zoom-btn" id="cv-nav-prev" title="Previous page">↑</button>'
+      + '    <button type="button" class="canvas-zoom-btn" id="cv-nav-next" title="Next page">↓</button>'
+      + '    <button type="button" class="canvas-zoom-btn" id="cv-nav-bot" title="Scroll to bottom">⇊</button>'
+      + '    <div class="canvas-spacer"></div>'
+      + '    <button type="button" class="canvas-zoom-btn" id="cv-zoom-in" title="Zoom in">+</button>'
+      + '    <button type="button" class="canvas-zoom-btn" id="cv-zoom-out" title="Zoom out">−</button>'
+      + '    <button type="button" class="canvas-zoom-btn" id="cv-zoom-reset" title="Reset zoom">⊙</button>'
+      + '  </div>'
+      + '</div>'
+      + '</div>';
     document.getElementById('canvas-mode-toggle').addEventListener('click', function () {
       summaryMode = !summaryMode;
       selectedPath = null; activePath = null;
@@ -579,7 +1084,15 @@ CANVAS_SCRIPT = r"""
       this.textContent = summaryMode ? 'Show code' : 'Show summaries';
       relayout();
     });
-    window.addEventListener('resize', function () { if (built) relayout(); });
+    
+    bindDragAndZoom();
+    
+    window.addEventListener('resize', function () {
+      if (built) {
+        updateAreaHeight();
+        updateZoomDependentStyles();
+      }
+    });
   }
 
   function build() {
@@ -603,6 +1116,13 @@ CANVAS_SCRIPT = r"""
     scaffold(container);
     tree = buildTree();
     renderLevels();
+    
+    scale = 1.0;
+    translateX = 40;
+    translateY = 40;
+    setTransform(scale, translateX, translateY);
+    updateAreaHeight();
+    
     relayout();
     built = true;
   }
