@@ -32,6 +32,10 @@ CANVAS_STYLE = """
   overflow: hidden;
 }
 #canvas-view.open { display: flex; }
+/* When canvas is the active view, the info panel sibling must not reserve
+   layout space (its box would otherwise sit on the right, producing empty
+   unused area even while visually translated away). */
+#canvas-view.open ~ #panel { display: none !important; }
 
 /* ── Canvas toolbar (level switch + mode toggle) ─────────────────────────── */
 #canvas-bar {
@@ -175,14 +179,18 @@ body.canvas-global-dragging * {
   background: #1d1d24; border: 1px solid #565676; border-left: 4px solid var(--cv-accent, #007acc);
   border-radius: 6px; box-shadow: 0 8px 24px rgba(0,0,0,.5); overflow: hidden;
   display: flex; flex-direction: column;
+  --cv-side-kicker-size: 10px;
+  --cv-side-path-size: 12px;
+  --cv-side-text-size: 13px;
+  --cv-side-code-size: 11px;
 }
 .cv-side-head { padding: 8px 12px; border-bottom: 1px solid #3c3c3c; }
-.cv-side-kicker { font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: #888; }
-.cv-side-path { display: block; margin-top: 2px; font-size: 12px; font-weight: 600; color: #9cdcfe; word-break: break-word; }
+.cv-side-kicker { font-size: var(--cv-side-kicker-size); font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: #888; }
+.cv-side-path { display: block; margin-top: 2px; font-size: var(--cv-side-path-size); font-weight: 600; color: #9cdcfe; word-break: break-word; }
 .cv-side-body { padding: 10px 12px; overflow: auto; max-height: 60vh; }
-.cv-side-body .cv-sum-text { font-size: 13px; }
+.cv-side-body .cv-sum-text { font-size: var(--cv-side-text-size); }
 .cv-side-body pre {
-  margin: 0; font-family: 'Consolas','Courier New',monospace; font-size: 11px; line-height: 1.5;
+  margin: 0; font-family: 'Consolas','Courier New',monospace; font-size: var(--cv-side-code-size); line-height: 1.5;
   white-space: pre; color: #d4d4d4;
 }
 .cv-side-body pre .is-header { color: #6a9955; font-weight: 700; }
@@ -647,11 +655,24 @@ CANVAS_SCRIPT = r"""
     var accent = accentColor(splitPath(activePath)[0] || activePath, node.depth);
     var topPx = (cardTopMap && cardTopMap[activePath] != null) ? cardTopMap[activePath] : STAGE_PAD_TOP;
 
+    // Compute zoom-scaled width and fonts so floating summary / original code
+    // cards remain readable at any canvas scale (mirrors rail title scaling).
+    var currentSideW = Math.round(SIDE_W * Math.max(1, 1 / scale));
+    var zoomBase = 12 * Math.max(1, 1.25 / scale - 0.25);
+    var sideK = Math.max(8, Math.round(10 * (zoomBase / 12)));
+    var sideP = Math.max(9, Math.round(12 * (zoomBase / 12)));
+    var sideT = Math.max(9, Math.round(13 * (zoomBase / 12)));
+    var sideC = Math.max(8, Math.round(11 * (zoomBase / 12)));
+
     var card = document.createElement('div');
     card.className = 'cv-side-card';
     card.style.top = topPx + 'px';
-    card.style.setProperty('--cv-side-w', SIDE_W + 'px');
+    card.style.setProperty('--cv-side-w', currentSideW + 'px');
     card.style.setProperty('--cv-accent', accent);
+    card.style.setProperty('--cv-side-kicker-size', sideK + 'px');
+    card.style.setProperty('--cv-side-path-size', sideP + 'px');
+    card.style.setProperty('--cv-side-text-size', sideT + 'px');
+    card.style.setProperty('--cv-side-code-size', sideC + 'px');
     var head = document.createElement('div'); head.className = 'cv-side-head';
     var kick = document.createElement('div'); kick.className = 'cv-side-kicker';
     var path = document.createElement('span'); path.className = 'cv-side-path'; path.textContent = activePath;
@@ -837,11 +858,27 @@ CANVAS_SCRIPT = r"""
     var sideCol = document.getElementById('canvas-side-col');
     if (sideCol) {
       sideCol.style.left = (rw + COL_PAD + CODE_W + COL_PAD) + 'px';
+      // Keep floating side card (summary / original code) scaled on live zoom
+      var sideCard = sideCol.querySelector('.cv-side-card');
+      if (sideCard) {
+        var currentSideW = Math.round(SIDE_W * Math.max(1, 1 / scale));
+        var zoomBase = 12 * Math.max(1, 1.25 / scale - 0.25);
+        var sideK = Math.max(8, Math.round(10 * (zoomBase / 12)));
+        var sideP = Math.max(9, Math.round(12 * (zoomBase / 12)));
+        var sideT = Math.max(9, Math.round(13 * (zoomBase / 12)));
+        var sideC = Math.max(8, Math.round(11 * (zoomBase / 12)));
+        sideCard.style.setProperty('--cv-side-w', currentSideW + 'px');
+        sideCard.style.setProperty('--cv-side-kicker-size', sideK + 'px');
+        sideCard.style.setProperty('--cv-side-path-size', sideP + 'px');
+        sideCard.style.setProperty('--cv-side-text-size', sideT + 'px');
+        sideCard.style.setProperty('--cv-side-code-size', sideC + 'px');
+      }
     }
     
     var stage = document.getElementById('canvas-stage');
     if (stage) {
-      stage.style.minWidth = (rw + COL_PAD + CODE_W + COL_PAD + SIDE_W + COL_PAD) + 'px';
+      var currentSideWForMin = Math.round(SIDE_W * Math.max(1, 1 / scale));
+      stage.style.minWidth = (rw + COL_PAD + CODE_W + COL_PAD + currentSideWForMin + COL_PAD) + 'px';
       
       var contentCol = document.getElementById(summaryMode ? 'canvas-summary-col' : 'canvas-code-col');
       var railH = 0;
