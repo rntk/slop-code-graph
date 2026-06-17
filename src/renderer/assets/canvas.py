@@ -328,7 +328,7 @@ CANVAS_SCRIPT = r"""
 
   function adjustCrowdedLevelCards(levelCards) {
     var sortedCards = levelCards.slice().sort(function (left, right) {
-      return left.top - right.top || left.path.localeCompare(right.path);
+      return left.top - right.top || left.startUnit - right.startUnit || left.path.localeCompare(right.path);
     });
 
     var workingCards = sortedCards.map(function (card, index) {
@@ -341,11 +341,13 @@ CANVAS_SCRIPT = r"""
 
       return {
         path: card.path,
+        visualKey: card.visualKey || card.path,
         name: card.name,
         depth: card.depth,
         rootName: card.rootName,
         unitCount: card.unitCount,
         startUnit: card.startUnit,
+        endUnit: card.endUnit,
         top: card.top || 0,
         height: height,
         originalTop: card.top || 0,
@@ -365,11 +367,13 @@ CANVAS_SCRIPT = r"""
     return workingCards.map(function (card) {
       return {
         path: card.path,
+        visualKey: card.visualKey || card.path,
         name: card.name,
         depth: card.depth,
         rootName: card.rootName,
         unitCount: card.unitCount,
         startUnit: card.startUnit,
+        endUnit: card.endUnit,
         top: Math.round(card.top),
         height: Math.round(card.height),
         zIndex: getDenseCardZIndex(card, card.isCrowded)
@@ -395,9 +399,36 @@ CANVAS_SCRIPT = r"""
       return (
         left.depth - right.depth ||
         left.top - right.top ||
+        left.startUnit - right.startUnit ||
         left.path.localeCompare(right.path)
       );
     });
+  }
+
+  function contiguousUnitRuns(units) {
+    var sorted = Array.from(units || []).sort(function (a, b) { return a - b; });
+    if (!sorted.length) return [];
+    var runs = [[sorted[0]]];
+    for (var i = 1; i < sorted.length; i++) {
+      var lastRun = runs[runs.length - 1];
+      if (sorted[i] === lastRun[lastRun.length - 1] + 1) lastRun.push(sorted[i]);
+      else runs.push([sorted[i]]);
+    }
+    return runs;
+  }
+
+  function makeCardFromUnitRun(n, run, top, bottom) {
+    var startUnit = run.length ? run[0] : 0;
+    var endUnit = run.length ? run[run.length - 1] : startUnit;
+    return {
+      path: n.path, name: n.name, depth: n.depth,
+      visualKey: n.path + '::' + startUnit + '-' + endUnit,
+      rootName: splitPath(n.path)[0] || n.name,
+      unitCount: run.length,
+      startUnit: startUnit,
+      endUnit: endUnit,
+      top: top, height: Math.max(CARD_MIN_H, bottom - top),
+    };
   }
 
   function getTitleLineBudget(h) {
@@ -476,19 +507,20 @@ CANVAS_SCRIPT = r"""
   // ── Card layout: position each node by its measured units, columns by level
   function layoutCards(metrics) {
     var nodes = nodesUpToLevel(tree.root, selectedLevel);
-    var cards = nodes.map(function (n) {
-      var units = Array.from(n.units).sort(function (a, b) { return a - b; });
-      var tops = [], bots = [];
-      units.forEach(function (u) { var mm = metrics.get(u); if (mm) { tops.push(mm.top); bots.push(mm.bottom); } });
-      var top = tops.length ? Math.min.apply(null, tops) : STAGE_PAD_TOP;
-      var bottom = bots.length ? Math.max.apply(null, bots) : top + CARD_MIN_H;
-      return {
-        path: n.path, name: n.name, depth: n.depth,
-        rootName: splitPath(n.path)[0] || n.name,
-        unitCount: n.units.size,
-        startUnit: units.length ? units[0] : 0,
-        top: top, height: Math.max(CARD_MIN_H, bottom - top),
-      };
+    var cards = [];
+    nodes.forEach(function (n) {
+      var runs = contiguousUnitRuns(n.units);
+      if (!runs.length) {
+        cards.push(makeCardFromUnitRun(n, [], STAGE_PAD_TOP, STAGE_PAD_TOP + CARD_MIN_H));
+        return;
+      }
+      runs.forEach(function (units) {
+        var tops = [], bots = [];
+        units.forEach(function (u) { var mm = metrics.get(u); if (mm) { tops.push(mm.top); bots.push(mm.bottom); } });
+        var top = tops.length ? Math.min.apply(null, tops) : STAGE_PAD_TOP;
+        var bottom = bots.length ? Math.max.apply(null, bots) : top + CARD_MIN_H;
+        cards.push(makeCardFromUnitRun(n, units, top, bottom));
+      });
     });
     return getAdjustedHierarchyCards(cards);
   }
@@ -516,11 +548,14 @@ CANVAS_SCRIPT = r"""
           tops.push(leafRect[p].top); bots.push(leafRect[p].bottom);
         }
       });
+      var units = Array.from(n.units).sort(function (a, b) { return a - b; });
       var top = tops.length ? Math.min.apply(null, tops) : STAGE_PAD_TOP;
       var bottom = bots.length ? Math.max.apply(null, bots) : top + CARD_MIN_H;
       return {
         path: n.path, name: n.name, depth: n.depth, rootName: splitPath(n.path)[0] || n.name,
-        unitCount: n.units.size, startUnit: Array.from(n.units).sort(function (a, b) { return a - b; })[0] || 0,
+        unitCount: n.units.size,
+        startUnit: units[0] || 0,
+        endUnit: units.length ? units[units.length - 1] : 0,
         top: top, height: Math.max(CARD_MIN_H, bottom - top),
       };
     });
@@ -546,6 +581,7 @@ CANVAS_SCRIPT = r"""
       el.style.setProperty('--topic-card-height', c.height + 'px');
       el.style.setProperty('--cv-accent', accentColor(c.rootName, c.depth));
       el.setAttribute('data-path', c.path);
+      el.setAttribute('data-visual-key', c.visualKey || c.path);
       el.setAttribute('data-depth', c.depth);
       el.setAttribute('data-height', c.height);
       el.style.zIndex = c.zIndex || (c.depth === 0 ? 10 : 5);
@@ -1056,7 +1092,9 @@ CANVAS_SCRIPT = r"""
     requestAnimationFrame(function () {
       var cards = summaryMode ? layoutCardsSummary() : layoutCards(measureCodeMetrics());
       lastCardTops = {};
-      cards.forEach(function (c) { lastCardTops[c.path] = c.top; });
+      cards.forEach(function (c) {
+        if (lastCardTops[c.path] == null || c.top < lastCardTops[c.path]) lastCardTops[c.path] = c.top;
+      });
       renderRail(cards);
       renderSideCard(lastCardTops);
       applyHighlight();
