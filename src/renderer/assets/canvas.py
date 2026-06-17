@@ -791,13 +791,70 @@ CANVAS_SCRIPT = r"""
   }
   function scrollToActive() {
     if (!activePath) return;
-    var top = lastCardTops && lastCardTops[activePath];
-    if (top == null) return;
+    // Measure the actual content bounds (code lines or summary cards) for this path.
+    var bounds = getActiveContentBounds();
+    if (!bounds) {
+      // Fallback to last known rail card top if content bounds unavailable
+      var top = lastCardTops && lastCardTops[activePath];
+      if (top == null) return;
+      var scroll0 = document.getElementById('canvas-scroll');
+      var wrapH0 = scroll0.clientHeight;
+      var nextY0 = wrapH0 * 0.2 - top * scale;
+      animateTransform(scale, translateX, nextY0);
+      return;
+    }
+    // Zoom in if currently zoomed out; target at least 1:1 for readability.
+    var targetScale = Math.max(1.0, scale);
     var scroll = document.getElementById('canvas-scroll');
-    var wrapHeight = scroll.clientHeight;
-    var localTargetY = top;
-    var nextY = wrapHeight * 0.2 - localTargetY * scale;
-    animateTransform(scale, translateX, nextY);
+    var wrapHeight = scroll ? scroll.clientHeight : 600;
+
+    // Compute content column's stage-local left at the target scale so we can
+    // also pan X to bring the related summary/source code into view.
+    var targetCardW = CARD_W * Math.max(1, 1 / targetScale);
+    var targetRW = RAIL_PADDING * 2 + (selectedLevel + 1) * targetCardW + selectedLevel * COL_GAP;
+    var contentLeftLocal = targetRW + COL_PAD;
+
+    // Aim to place the content column a little to the right of the viewport's left,
+    // leaving the rail partially visible for context.
+    var desiredContentScreenLeft = 80;
+    var nextX = desiredContentScreenLeft - contentLeftLocal * targetScale;
+
+    // Position the content top near 20% of the viewport for context.
+    var nextY = wrapHeight * 0.2 - bounds.top * targetScale;
+    animateTransform(targetScale, nextX, nextY);
+  }
+
+  // Return { top, bottom } stage coords covering the content for activePath.
+  // Code mode: bounds of the code lines for the node's units.
+  // Summary mode: bounds of summary cards whose path matches or is under activePath.
+  function getActiveContentBounds() {
+    if (!activePath || !tree) return null;
+    var node = tree.byPath.get(activePath);
+    if (!node) return null;
+
+    if (summaryMode) {
+      // Measure current summary cards and aggregate for this path and descendants.
+      var leafRect = measureSummaryMetrics();
+      var tops = [], bots = [];
+      Object.keys(leafRect).forEach(function (p) {
+        if (p === activePath || p.indexOf(activePath + ' > ') === 0 || activePath.indexOf(p + ' > ') === 0) {
+          tops.push(leafRect[p].top);
+          bots.push(leafRect[p].bottom);
+        }
+      });
+      if (!tops.length) return null;
+      return { top: Math.min.apply(null, tops), bottom: Math.max.apply(null, bots) };
+    } else {
+      // Code mode: aggregate code line positions for the node's units.
+      var metrics = measureCodeMetrics();
+      var tops = [], bots = [];
+      node.units.forEach(function (u) {
+        var m = metrics.get(u);
+        if (m) { tops.push(m.top); bots.push(m.bottom); }
+      });
+      if (!tops.length) return null;
+      return { top: Math.min.apply(null, tops), bottom: Math.max.apply(null, bots) };
+    }
   }
   function bindCard(el, path) {
     el.addEventListener('mouseenter', function () { if (!selectedPath) setActiveNoScroll(path); });
