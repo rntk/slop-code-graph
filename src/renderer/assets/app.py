@@ -328,15 +328,18 @@ document.getElementById('btn-external').addEventListener('click', function () {
 
 // Toggle file-container grouping, then re-run the current layout.
 let groupByFile = true;
+let summaryOnly = false;
 function refreshGroupControls() {
   const groupBtn = document.getElementById('btn-group');
   const modeSelect = document.getElementById('group-select');
   const levels = document.getElementById('topic-levels');
-  groupBtn.classList.toggle('active', groupByFile);
-  groupBtn.textContent = groupByFile ? 'Grouping on' : 'Grouping off';
-  modeSelect.style.display = groupByFile ? '' : 'none';
+  const topicSummaryActive = summaryOnly && summaryKind() === 'topic';
+  const controlsVisible = groupByFile || topicSummaryActive;
+  groupBtn.classList.toggle('active', controlsVisible);
+  groupBtn.textContent = controlsVisible ? 'Grouping on' : 'Grouping off';
+  modeSelect.style.display = controlsVisible ? '' : 'none';
   modeSelect.value = groupMode;
-  levels.style.display = groupByFile && groupMode === 'topic' ? '' : 'none';
+  levels.style.display = controlsVisible && groupMode === 'topic' ? '' : 'none';
   levels.querySelectorAll('button').forEach((btn) => {
     btn.classList.toggle('active', Number(btn.dataset.level) === topicLevel);
   });
@@ -469,7 +472,6 @@ if (HAS_FILE_SUMMARIES) {
   });
 }
 
-let summaryOnly = false;
 const savedLabels = new Map();
 let savedGroupByFile = true;
 const SUMMARY_NODE_FILL = '#2a2a42';
@@ -604,8 +606,14 @@ function applySummaryMode(on) {
 
   if (on) {
     savedGroupByFile = groupByFile;
-    groupByFile = false;
-    gv.setGrouping(false);
+    if (summaryKind() === 'topic') {
+      groupByFile = true;
+      gv.setGrouping(true);
+    } else {
+      groupByFile = false;
+      gv.setGrouping(false);
+    }
+    refreshGroupControls();
     applySummaryNodeState();
   } else {
     gv.o.endpointOf = null;
