@@ -132,6 +132,36 @@ def test_render_includes_summary_only_toggle():
     assert "fileSummaries" in out
 
 
+def test_render_includes_canvas_topic_group_controls():
+    graph = CallGraph(nodes=[_node()], edges=[])
+    canvas = {
+        "lines": ["=== test.py :: foo (L1-1) ===", "def foo(): pass"],
+        "lineMeta": [
+            {"kind": "header", "nodeId": "n1", "relativeFile": "test.py"},
+            {"kind": "code", "nodeId": "n1", "relativeFile": "test.py"},
+        ],
+        "topics": [
+            {
+                "path": "Setup>Validation",
+                "name": "Validation",
+                "level": 2,
+                "ranges": [{"start": 0, "end": 1}],
+                "lineNumbers": [1, 2],
+                "summary": "Validates input.",
+            }
+        ],
+        "stats": {"lineCount": 2, "topicCount": 1},
+    }
+
+    out = render(graph, "t", canvas=canvas)
+
+    assert "group-select" in out
+    assert "topic-levels" in out
+    assert "Canvas topics" in out
+    assert "Setup>Validation" in out
+    assert "Validates input." in out
+
+
 def test_render_embeds_flow_data():
     flow = [{"t": "if", "cond": "x > 0", "then": [], "else": []}]
     graph = CallGraph(nodes=[_node(flow=flow)], edges=[])

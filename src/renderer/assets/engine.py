@@ -73,8 +73,8 @@ class GraphView {
     this.minZoom = 0.02;
     this.maxZoom = 8;
     this._id = ++GV_SEQ;
-    // File grouping: on by default when the caller supplies a groupOf accessor.
-    // Grouped layouts fill _groupBoxes with absolute file-container rects.
+    // Grouping: on by default when the caller supplies a groupOf accessor.
+    // Grouped layouts fill _groupBoxes with absolute container rects.
     this.grouping = !!(this.o && this.o.groupOf);
     this._groupBoxes = [];
     this._build();
@@ -341,14 +341,16 @@ class GraphView {
     this._redrawGroups();
   }
 
-  // Render the file-container boxes computed by _dagreGrouped. Rebuilt from
+  // Render the grouping boxes computed by grouped layouts. Rebuilt from
   // scratch each time so toggling grouping / re-running a flat layout simply
   // clears them (empty _groupBoxes -> empty layer).
   _redrawGroups() {
     const layer = this.gLayer;
     while (layer.firstChild) layer.removeChild(layer.firstChild);
     (this._groupBoxes || []).forEach((b) => {
-      const g = svgEl('g', { class: 'gv-group' });
+      const cls = 'gv-group' + (b.depth != null ? ' depth-' + b.depth : '');
+      const g = svgEl('g', { class: cls });
+      if (b.key != null) g.setAttribute('data-group-key', b.key);
       const rect = svgEl('rect', {
         x: b.x, y: b.y, width: b.w, height: b.h, rx: 10, ry: 10, class: 'gv-group-box',
       });
@@ -358,6 +360,7 @@ class GraphView {
         x: b.x + 12, y: b.y + 16, class: 'gv-group-label',
       });
       label.textContent = b.label;
+      if (b.key != null) label.setAttribute('data-group-key', b.key);
       if (b.color) label.style.fill = b.color;
       g.appendChild(label);
       layer.appendChild(g);
@@ -366,6 +369,17 @@ class GraphView {
 
   setGrouping(on) {
     this.grouping = !!on && !!this.o.groupOf;
+  }
+
+  _groupPath(id) {
+    if (this.o.groupPathOf) {
+      const p = this.o.groupPathOf(this.N.get(id).data);
+      if (Array.isArray(p)) return p.map((x) => String(x || '').trim()).filter(Boolean);
+      if (p == null || p === '') return [];
+      return [String(p)];
+    }
+    const k = this.o.groupOf ? this.o.groupOf(this.N.get(id).data) : null;
+    return (k == null || k === '') ? [] : [String(k)];
   }
 
   // ---- layouts ----------------------------------------------------------
@@ -532,6 +546,10 @@ class GraphView {
   // Because a node's relative position is clamped within its box's padding, the
   // function nodes are always fully contained by their file box.
   _dagreGrouped(rankDir, nodeSep, rankSep) {
+    if (this.o.groupPathOf) {
+      this._hierarchicalGroupedLayout('dagre', { rankDir, nodeSep, rankSep });
+      return;
+    }
     const PAD = 16;        // inner margin around the nodes inside a box
     const HEADER = 26;     // extra top space for the file label
     const all = [...this.N.keys()].filter((i) => !this.N.get(i).hidden);
@@ -612,7 +630,7 @@ class GraphView {
         const rel = intra.get(id), n = this.N.get(id);
         n.x = x0 + rel.x; n.y = y0 + rel.y;
       });
-      boxes.push({ x: x0, y: y0, w: sz.w, h: sz.h, label: metaLabel.get(key), color: metaColor.get(key) });
+      boxes.push({ x: x0, y: y0, w: sz.w, h: sz.h, label: metaLabel.get(key), key, color: metaColor.get(key), depth: 0 });
     });
     loners.forEach((id) => {
       const c = mpos.get(id), n = this.N.get(id);
@@ -772,6 +790,10 @@ class GraphView {
   }
 
   _groupedLayout(mode) {
+    if (this.o.groupPathOf) {
+      this._hierarchicalGroupedLayout(mode, {});
+      return;
+    }
     const PAD = 16;
     const HEADER = 26;
     const all = [...this.N.keys()].filter((i) => !this.N.get(i).hidden);
@@ -841,13 +863,163 @@ class GraphView {
         const rel = intra.get(id), n = this.N.get(id);
         n.x = x0 + rel.x; n.y = y0 + rel.y;
       });
-      boxes.push({ x: x0, y: y0, w: sz.w, h: sz.h, label: metaLabel.get(key), color: metaColor.get(key) });
+      boxes.push({ x: x0, y: y0, w: sz.w, h: sz.h, label: metaLabel.get(key), key, color: metaColor.get(key), depth: 0 });
     });
     loners.forEach((id) => {
       const c = mpos.get(id), n = this.N.get(id);
       n.x = c.x; n.y = c.y;
     });
     this._groupBoxes = boxes;
+  }
+
+  _layoutForMode(mode, ids, edges, sizeOf, opts) {
+    opts = opts || {};
+    if (mode === 'dagre') {
+      return this._layoutDagre(
+        ids, edges, sizeOf,
+        opts.rankDir || 'TB',
+        opts.nodeSep || 34,
+        opts.rankSep || 90,
+      );
+    }
+    if (mode === 'concentric') return this._layoutConcentric(ids, edges);
+    return this._layoutCose(ids, edges);
+  }
+
+  _hierarchicalGroupedLayout(mode, opts) {
+    const PAD = 18;
+    const HEADER = 28;
+    const all = [...this.N.keys()].filter((i) => !this.N.get(i).hidden);
+    if (!all.length) { this._groupBoxes = []; return; }
+
+    const paths = new Map();
+    all.forEach((id) => paths.set(id, this._groupPath(id)));
+    const E = this._visibleEdges(all);
+    const boxes = [];
+
+    const cluster = (ids, level, prefix) => {
+      const childMap = new Map();
+      const local = [];
+      ids.forEach((id) => {
+        const p = paths.get(id) || [];
+        if (p.length > level) {
+          const seg = p[level];
+          if (!childMap.has(seg)) childMap.set(seg, []);
+          childMap.get(seg).push(id);
+        } else {
+          local.push(id);
+        }
+      });
+
+      if (!childMap.size) {
+        const innerEdges = E.filter(([s, t]) => ids.includes(s) && ids.includes(t));
+        const pos = this._layoutForMode(mode, ids, innerEdges, (id) => this.N.get(id), opts);
+        let minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+        ids.forEach((id) => {
+          const n = this.N.get(id), p = pos.get(id) || { x: 0, y: 0 };
+          minX = Math.min(minX, p.x - n.w / 2); maxX = Math.max(maxX, p.x + n.w / 2);
+          minY = Math.min(minY, p.y - n.h / 2); maxY = Math.max(maxY, p.y + n.h / 2);
+        });
+        if (!ids.length) { minX = minY = 0; maxX = maxY = 1; }
+        const nodePos = new Map();
+        ids.forEach((id) => {
+          const p = pos.get(id) || { x: 0, y: 0 };
+          nodePos.set(id, { x: p.x - minX + PAD, y: p.y - minY + PAD + HEADER });
+        });
+        return {
+          w: Math.max(80, (maxX - minX) + PAD * 2),
+          h: Math.max(54, (maxY - minY) + PAD * 2 + HEADER),
+          nodePos,
+          childBoxes: [],
+        };
+      }
+
+      const childLayouts = new Map();
+      const metaIds = [];
+      const metaSize = new Map();
+      childMap.forEach((childIds, seg) => {
+        const key = prefix.concat(seg).join('>');
+        const child = cluster(childIds, level + 1, prefix.concat(seg));
+        childLayouts.set(seg, child);
+        metaIds.push(key);
+        metaSize.set(key, { w: child.w, h: child.h });
+      });
+      local.forEach((id) => {
+        metaIds.push(id);
+        const n = this.N.get(id);
+        metaSize.set(id, { w: n.w, h: n.h });
+      });
+
+      const idToMeta = (id) => {
+        const p = paths.get(id) || [];
+        if (p.length > level) return prefix.concat(p[level]).join('>');
+        return id;
+      };
+      const metaSeen = new Set();
+      const metaE = [];
+      E.forEach(([s, t]) => {
+        if (!ids.includes(s) || !ids.includes(t)) return;
+        const ms = idToMeta(s), mt = idToMeta(t);
+        if (ms === mt) return;
+        const k = ms + '##' + mt;
+        if (metaSeen.has(k)) return;
+        metaSeen.add(k);
+        metaE.push([ms, mt]);
+      });
+      const metaOpts = mode === 'dagre'
+        ? { rankDir: opts.rankDir || 'TB', nodeSep: (opts.nodeSep || 34) + 24, rankSep: (opts.rankSep || 90) + 24 }
+        : opts;
+      const mpos = this._layoutForMode(mode, metaIds, metaE, (id) => metaSize.get(id), metaOpts);
+      if (mode !== 'dagre') this._separateMetaBoxes(metaIds, mpos, metaSize);
+
+      let minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+      metaIds.forEach((id) => {
+        const p = mpos.get(id) || { x: 0, y: 0 }, sz = metaSize.get(id);
+        minX = Math.min(minX, p.x - sz.w / 2); maxX = Math.max(maxX, p.x + sz.w / 2);
+        minY = Math.min(minY, p.y - sz.h / 2); maxY = Math.max(maxY, p.y + sz.h / 2);
+      });
+
+      const nodePos = new Map();
+      const childBoxes = [];
+      childMap.forEach((childIds, seg) => {
+        const key = prefix.concat(seg).join('>');
+        const child = childLayouts.get(seg);
+        const c = mpos.get(key) || { x: 0, y: 0 };
+        const x0 = c.x - child.w / 2 - minX + PAD;
+        const y0 = c.y - child.h / 2 - minY + PAD + HEADER;
+        child.nodePos.forEach((p, nid) => nodePos.set(nid, { x: x0 + p.x, y: y0 + p.y }));
+        const color = this.o.groupColorOf ? this.o.groupColorOf(key, level) : null;
+        childBoxes.push({
+          x: x0, y: y0, w: child.w, h: child.h,
+          label: this.o.groupLabelOf ? this.o.groupLabelOf(key) : seg,
+          key,
+          color,
+          depth: level,
+        });
+        child.childBoxes.forEach((b) => childBoxes.push({
+          x: x0 + b.x, y: y0 + b.y, w: b.w, h: b.h,
+          label: b.label, key: b.key, color: b.color, depth: b.depth,
+        }));
+      });
+      local.forEach((id) => {
+        const c = mpos.get(id) || { x: 0, y: 0 };
+        nodePos.set(id, { x: c.x - minX + PAD, y: c.y - minY + PAD + HEADER });
+      });
+
+      return {
+        w: Math.max(100, (maxX - minX) + PAD * 2),
+        h: Math.max(64, (maxY - minY) + PAD * 2 + HEADER),
+        nodePos,
+        childBoxes,
+      };
+    };
+
+    const root = cluster(all, 0, []);
+    root.nodePos.forEach((p, id) => {
+      const n = this.N.get(id);
+      n.x = p.x; n.y = p.y;
+    });
+    this._groupBoxes = root.childBoxes;
   }
 
   // ---- viewport helpers -------------------------------------------------

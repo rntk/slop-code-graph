@@ -6,6 +6,65 @@ Injected verbatim into the generated HTML via the @@APP@@ placeholder.
 APP_SCRIPT = r"""
 // ── Data ──────────────────────────────────────────────────────────────────
 const GRAPH_DATA = @@GRAPHDATA@@;
+const HAS_CANVAS_TOPICS = !!(GRAPH_DATA && GRAPH_DATA.canvas
+  && Array.isArray(GRAPH_DATA.canvas.topics)
+  && GRAPH_DATA.canvas.topics.length
+  && Array.isArray(GRAPH_DATA.canvas.lineMeta));
+
+function splitTopicPath(path) {
+  return String(path || '').split('>').map((p) => p.trim()).filter(Boolean);
+}
+
+function buildTopicGraphIndex() {
+  const empty = { nodeTopicPath: {}, topicSummaries: {}, maxLevel: 0 };
+  if (!HAS_CANVAS_TOPICS) return empty;
+  const canvas = GRAPH_DATA.canvas;
+  const counts = {};
+  const prefixSummaries = {};
+  canvas.topics.forEach((t) => {
+    const parts = splitTopicPath(t.path || t.name);
+    if (!parts.length) return;
+    const path = parts.join('>');
+    empty.topicSummaries[path] = t.summary || '';
+    empty.maxLevel = Math.max(empty.maxLevel, parts.length - 1);
+    for (let i = 1; i <= parts.length; i++) {
+      const prefix = parts.slice(0, i).join('>');
+      if (!prefixSummaries[prefix]) prefixSummaries[prefix] = [];
+      if (t.summary) prefixSummaries[prefix].push(t.summary);
+    }
+    (t.ranges || []).forEach((r) => {
+      const start = Math.max(0, Number(r.start) || 0);
+      const end = Math.min(canvas.lineMeta.length - 1, Number(r.end) || start);
+      for (let i = start; i <= end; i++) {
+        const meta = canvas.lineMeta[i] || {};
+        const nid = meta.nodeId || '';
+        if (!nid) continue;
+        if (!counts[nid]) counts[nid] = {};
+        counts[nid][path] = (counts[nid][path] || 0) + 1;
+      }
+    });
+  });
+  Object.entries(counts).forEach(([nid, byPath]) => {
+    let bestPath = '', bestCount = -1;
+    Object.entries(byPath).forEach(([path, count]) => {
+      if (count > bestCount || (count === bestCount && path.length > bestPath.length)) {
+        bestPath = path;
+        bestCount = count;
+      }
+    });
+    if (bestPath) empty.nodeTopicPath[nid] = splitTopicPath(bestPath);
+  });
+  Object.entries(prefixSummaries).forEach(([path, summaries]) => {
+    if (!empty.topicSummaries[path] && summaries.length) {
+      empty.topicSummaries[path] = summaries.slice(0, 4).join('\n\n');
+    }
+  });
+  return empty;
+}
+
+const TOPIC_GRAPH = buildTopicGraphIndex();
+let groupMode = 'file';
+let topicLevel = 0;
 
 // ── Graph engine init ───────────────────────────────────────────────────────
 const gv = new GraphView(document.getElementById('cy'), {
@@ -13,10 +72,29 @@ const gv = new GraphView(document.getElementById('cy'), {
   edges: GRAPH_DATA.edges,
   nodeClasses: (n) => n.language + (n.language === 'external' ? ' external' : '') + (n.is_entrypoint ? ' entrypoint' : ''),
   shapeOf: (n) => (n.language === 'external' ? 'round-tag' : 'round-rectangle'),
-  // Group function nodes into file containers in graph layouts.
-  // External (stdlib/builtin) nodes are deduped across files, so they belong to
-  // no single file and stay ungrouped (null).
-  groupOf: (n) => (n.language === 'external' ? null : (n.relative_file || n.file || null)),
+  // Group function nodes into file or Canvas-topic containers in graph layouts.
+  // External (stdlib/builtin) nodes are deduped across files/topics, so they
+  // stay ungrouped (null).
+  groupOf: (n) => {
+    if (n.language === 'external') return null;
+    if (groupMode === 'topic') {
+      const p = TOPIC_GRAPH.nodeTopicPath[n.id];
+      return p && p.length ? p.slice(0, topicLevel + 1).join('>') : 'Uncategorized';
+    }
+    return n.relative_file || n.file || null;
+  },
+  groupPathOf: (n) => {
+    if (n.language === 'external') return null;
+    if (groupMode !== 'topic') return [n.relative_file || n.file || 'Unknown file'];
+    const p = TOPIC_GRAPH.nodeTopicPath[n.id];
+    return p && p.length ? p.slice(0, topicLevel + 1) : ['Uncategorized'];
+  },
+  groupLabelOf: (key) => groupMode === 'topic' ? (splitTopicPath(key).slice(-1)[0] || key) : key,
+  groupColorOf: (key, depth) => {
+    if (groupMode !== 'topic') return null;
+    const colors = ['#4ec9b0', '#dcdcaa', '#c586c0', '#9cdcfe', '#ce9178'];
+    return colors[Math.max(0, depth || 0) % colors.length];
+  },
   labelOf: (n) => (n.class_name ? n.class_name + '.' + n.name : n.name),
   fillOf: (n) => n.color,
   edgeClasses: (e) => e.confidence,
@@ -65,8 +143,9 @@ if (gv && gv.svg) {
     const g = e.target && e.target.closest ? e.target.closest('.gv-group') : null;
     if (g) {
       const lbl = g.querySelector ? g.querySelector('text') : null;
-      const key = (lbl && lbl.textContent ? lbl.textContent.trim() : '');
-      const sum = FILE_SUMMARIES[key];
+      const key = (g.dataset && g.dataset.groupKey)
+        || (lbl && lbl.textContent ? lbl.textContent.trim() : '');
+      const sum = groupMode === 'topic' ? TOPIC_GRAPH.topicSummaries[key] : FILE_SUMMARIES[key];
       if (sum) {
         showGroupTooltip(sum, e.clientX, e.clientY);
         return;
@@ -80,8 +159,9 @@ if (gv && gv.svg) {
     const g = e.target && e.target.closest ? e.target.closest('.gv-group') : null;
     if (g) {
       const lbl = g.querySelector ? g.querySelector('text') : null;
-      const key = (lbl && lbl.textContent ? lbl.textContent.trim() : '');
-      const sum = FILE_SUMMARIES[key];
+      const key = (g.dataset && g.dataset.groupKey)
+        || (lbl && lbl.textContent ? lbl.textContent.trim() : '');
+      const sum = groupMode === 'topic' ? TOPIC_GRAPH.topicSummaries[key] : FILE_SUMMARIES[key];
       if (sum) {
         showGroupTooltip(sum, e.clientX, e.clientY);
       }
@@ -245,11 +325,65 @@ document.getElementById('btn-external').addEventListener('click', function () {
 
 // Toggle file-container grouping, then re-run the current layout.
 let groupByFile = true;
+function refreshGroupControls() {
+  const groupBtn = document.getElementById('btn-group');
+  const modeSelect = document.getElementById('group-select');
+  const levels = document.getElementById('topic-levels');
+  groupBtn.classList.toggle('active', groupByFile);
+  groupBtn.textContent = groupByFile ? 'Grouping on' : 'Grouping off';
+  modeSelect.style.display = groupByFile ? '' : 'none';
+  modeSelect.value = groupMode;
+  levels.style.display = groupByFile && groupMode === 'topic' ? '' : 'none';
+  levels.querySelectorAll('button').forEach((btn) => {
+    btn.classList.toggle('active', Number(btn.dataset.level) === topicLevel);
+  });
+}
+
+function rebuildTopicLevelButtons() {
+  const levels = document.getElementById('topic-levels');
+  levels.innerHTML = '';
+  for (let i = 0; i <= TOPIC_GRAPH.maxLevel; i++) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'tb-btn topic-level-btn';
+    btn.dataset.level = String(i);
+    btn.textContent = 'L' + i;
+    btn.title = 'Show Canvas topic level ' + i;
+    levels.appendChild(btn);
+  }
+}
+
+if (HAS_CANVAS_TOPICS) {
+  const groupSelect = document.getElementById('group-select');
+  const opt = document.createElement('option');
+  opt.value = 'topic';
+  opt.textContent = 'Canvas topics';
+  groupSelect.appendChild(opt);
+  rebuildTopicLevelButtons();
+}
+refreshGroupControls();
+
 document.getElementById('btn-group').addEventListener('click', function () {
   if (summaryOnly) return;
   groupByFile = !groupByFile;
-  this.classList.toggle('active', groupByFile);
   gv.setGrouping(groupByFile);
+  refreshGroupControls();
+  applyLayout(document.getElementById('layout-select').value);
+});
+document.getElementById('group-select').addEventListener('change', function () {
+  if (summaryOnly) return;
+  groupMode = this.value === 'topic' && HAS_CANVAS_TOPICS ? 'topic' : 'file';
+  gv.setGrouping(groupByFile);
+  refreshGroupControls();
+  hideGroupTooltip();
+  applyLayout(document.getElementById('layout-select').value);
+});
+document.getElementById('topic-levels').addEventListener('click', function (e) {
+  const btn = e.target.closest('.topic-level-btn');
+  if (!btn || summaryOnly) return;
+  topicLevel = Math.max(0, Math.min(TOPIC_GRAPH.maxLevel, Number(btn.dataset.level) || 0));
+  refreshGroupControls();
+  hideGroupTooltip();
   applyLayout(document.getElementById('layout-select').value);
 });
 
@@ -314,9 +448,15 @@ function applySummaryMode(on) {
   summaryOnly = on;
   const btn = document.getElementById('btn-summary');
   const groupBtn = document.getElementById('btn-group');
+  const groupSelect = document.getElementById('group-select');
+  const topicLevels = document.getElementById('topic-levels');
   btn.classList.toggle('active', on);
   groupBtn.style.opacity = on ? '0.45' : '';
   groupBtn.style.pointerEvents = on ? 'none' : '';
+  groupSelect.style.opacity = on ? '0.45' : '';
+  groupSelect.style.pointerEvents = on ? 'none' : '';
+  topicLevels.style.opacity = on ? '0.45' : '';
+  topicLevels.style.pointerEvents = on ? 'none' : '';
 
   if (on) {
     savedGroupByFile = groupByFile;
@@ -357,7 +497,7 @@ function applySummaryMode(on) {
     savedLabels.clear();
     groupByFile = savedGroupByFile;
     gv.setGrouping(groupByFile);
-    groupBtn.classList.toggle('active', groupByFile);
+    refreshGroupControls();
     gv._redraw();
   }
   applyLayout(document.getElementById('layout-select').value);

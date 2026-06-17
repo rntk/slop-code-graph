@@ -115,6 +115,16 @@ select.tb-btn {
   padding: 4px 6px;
   min-width: 130px;
 }
+.topic-levels {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+}
+.topic-level-btn {
+  min-width: 32px;
+  padding-left: 7px;
+  padding-right: 7px;
+}
 
 /* ── Main area ── */
 #main {
@@ -133,8 +143,8 @@ select.tb-btn {
 
 /* ── SVG graph engine ── */
 .gv-svg { width: 100%; height: 100%; display: block; touch-action: none; }
-/* File containers: a translucent box drawn behind the function nodes that
-   belong to one source file, with the file path as a header label. */
+/* Group containers: translucent boxes drawn behind the function nodes. File
+   grouping uses one level; Canvas-topic grouping can nest topic levels. */
 .gv-group-box {
   fill: rgba(255, 255, 255, 0.025);
   stroke: #565676;
@@ -149,6 +159,14 @@ select.tb-btn {
   dominant-baseline: middle;
   opacity: 0.9;
 }
+.gv-group.depth-1 .gv-group-box { fill: rgba(255, 255, 255, 0.018); stroke-opacity: 0.62; }
+.gv-group.depth-2 .gv-group-box { fill: rgba(255, 255, 255, 0.012); stroke-opacity: 0.56; }
+.gv-group.depth-3 .gv-group-box,
+.gv-group.depth-4 .gv-group-box { fill: rgba(255, 255, 255, 0.008); stroke-opacity: 0.5; }
+.gv-group.depth-1 .gv-group-label,
+.gv-group.depth-2 .gv-group-label,
+.gv-group.depth-3 .gv-group-label,
+.gv-group.depth-4 .gv-group-label { font-size: 11px; }
 .node { cursor: pointer; }
 .node .shape { stroke-width: 0; }
 .node .nlabel { font-size: 11px; font-weight: 600; fill: #1e1e1e; pointer-events: none; }
@@ -391,7 +409,11 @@ select.tb-btn {
 
   <button class="tb-btn active" id="btn-possible" title="Toggle low-confidence edges" data-graph-only>Possible edges</button>
   <button class="tb-btn active" id="btn-external" title="Toggle external / stdlib / builtin calls" data-graph-only>External calls</button>
-  <button class="tb-btn active" id="btn-group" title="Group functions into file containers" data-graph-only>Group by file</button>
+  <button class="tb-btn active" id="btn-group" title="Toggle graph group containers" data-graph-only>Grouping on</button>
+  <select id="group-select" class="tb-btn" title="Graph grouping source" data-graph-only>
+    <option value="file">Files</option>
+  </select>
+  <span id="topic-levels" class="topic-levels" data-graph-only style="display:none"></span>
   <button class="tb-btn" id="btn-summary" title="Show file summaries instead of function names (requires LLM summaries)" data-graph-only style="display:none">Summary only</button>
 
   <div class="tb-sep" data-graph-only></div>
