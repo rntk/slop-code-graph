@@ -2,9 +2,51 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
+from pathlib import PurePath
 
 from .parsers import FunctionInfo
+
+# ── Test-file detection ─────────────────────────────────────────────────────
+# Production and test code form *different* flows. A production entrypoint must
+# never reach a test function: a test calls into production, not the other way
+# round, so any production→test edge is a name-collision false positive (e.g. a
+# production ``setup`` resolving to a test's ``setup``). We detect test files by
+# path so such edges can be dropped and so test files can be kept out of a
+# production scope. Heuristics span the languages the parser supports.
+_TEST_DIR_SEGMENTS = {"tests", "test", "__tests__", "testing", "spec", "specs"}
+# Snake/kebab/dotted conventions (Python, JS/TS, Go, …). Case-insensitive.
+_TEST_FILENAME_RE = re.compile(
+    r"""(?ix)
+    ^(
+        test[_-].+               # test_foo.py / test-foo.js
+      | .+[_-]test               # foo_test.go / foo-test.js
+      | .+\.(test|spec)          # foo.test.ts / foo.spec.js
+      | conftest                 # pytest conftest.py
+    )$
+    """
+)
+# CamelCase conventions (Java/C#/…): FooTest, FooTests, FooSpec. Case-sensitive
+# so that ordinary words ending in "test" (latest, request) don't match.
+_TEST_CAMEL_RE = re.compile(r".+(Test|Tests|Spec)$")
+
+
+def is_test_path(path: str) -> bool:
+    """Return True if ``path`` looks like a test/spec source file.
+
+    Matches on either a test directory anywhere in the path (``tests/``,
+    ``__tests__/``, ``spec/`` …) or a conventional test filename across the
+    supported languages (``test_x.py``, ``x_test.go``, ``x.test.ts``,
+    ``x.spec.js``, ``XTest.java``, ``conftest.py`` …).
+    """
+    if not path:
+        return False
+    p = PurePath(path)
+    if any(seg.lower() in _TEST_DIR_SEGMENTS for seg in p.parts[:-1]):
+        return True
+    stem = p.stem
+    return bool(_TEST_FILENAME_RE.match(stem) or _TEST_CAMEL_RE.match(stem))
 
 
 @dataclass
@@ -192,6 +234,7 @@ def build_graph(
         edge_counter += 1
 
     for fn in functions:
+        caller_is_test = is_test_path(fn.file)
         for call_name in fn.calls:
             # A call to one of the function's own parameter names is a local
             # reference (an injected callback / dependency), not a module-level
@@ -212,7 +255,17 @@ def build_graph(
             if not candidates:
                 candidates = by_name.get(call_name, [])
 
-            # No definition in the parsed set → external call.
+            # Production and test code are *different* flows. A non-test caller
+            # never genuinely calls a function defined in a test file: such a
+            # match is a name collision (e.g. a production ``setup`` resolving to
+            # a test's ``setup``). Drop test-file candidates so they can't pull a
+            # whole test file downstream into a production flow. (A test caller
+            # may freely call production code, so we only filter one direction.)
+            if not caller_is_test:
+                candidates = [c for c in candidates if not is_test_path(c.file)]
+
+            # No definition in the parsed set (or all matches were test-only) →
+            # external call.
             if not candidates:
                 if include_external:
                     _add_edge(fn.id, _external_node(call_name).id, "external")

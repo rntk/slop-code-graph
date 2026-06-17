@@ -19,7 +19,7 @@ import os
 import sys
 from pathlib import Path
 
-from src.graph_builder import CallGraph, build_graph, compute_flow_metadata
+from src.graph_builder import CallGraph, build_graph, compute_flow_metadata, is_test_path
 from src.parsers import get_registry, parse_files
 from src.renderer import render
 
@@ -316,9 +316,21 @@ def main():
     # those outside callers were parsed and so can actually be excluded here, for a
     # directory just as for a single file. The entrypoint detection below then
     # reveals where each remaining flow starts.
-    scope_files = (
-        {str(target)} if target.is_file() else {str(f) for f in files if target in f.parents}
-    )
+    if target.is_file():
+        scope_files = {str(target)}
+    else:
+        scope_files = {str(f) for f in files if target in f.parents}
+        # Production and test code are different flows. When the user points at a
+        # directory we seed the *production* flow only — test files that happen to
+        # live under it would otherwise each become their own entrypoint and mix
+        # test diagrams into the production one. A user who wants a test flow can
+        # point directly at the test file/dir (handled by the fallback below, and
+        # by the single-file branch above). If the scope is *entirely* tests
+        # (e.g. the target is a tests/ directory), keep them — that is clearly
+        # what was asked for.
+        production = {p for p in scope_files if not is_test_path(p)}
+        if production:
+            scope_files = production
 
     seed_ids: set[str] = {n.id for n in graph.nodes if n.file in scope_files}
 
