@@ -207,8 +207,9 @@ function showPanel(data) {
   currentData = data;
   panel.classList.add('open');
   const fileKey = data.relative_file || data.file || '';
-  const isSummaryNode = summaryOnly && proxyFileKey[data.id];
-  const title = isSummaryNode ? (fileKey || data.qualified_name || data.name) : (data.qualified_name || data.name);
+  const summaryInfo = summaryOnly ? proxySummaryInfo[data.id] : null;
+  const isSummaryNode = !!summaryInfo;
+  const title = isSummaryNode ? summaryInfo.title : (data.qualified_name || data.name);
   panelTitle.textContent = title;
   panelTitle.title = title;
 
@@ -219,6 +220,7 @@ function showPanel(data) {
 
   const fileSum = (GRAPH_DATA.fileSummaries && GRAPH_DATA.fileSummaries[fileKey]) ? GRAPH_DATA.fileSummaries[fileKey] : '';
   const safeFileSum = fileSum ? escapeHtml(fileSum) : '';
+  const proxySummary = summaryInfo && summaryInfo.summary ? escapeHtml(summaryInfo.summary) : '';
   const safeSummary = data.summary ? escapeHtml(data.summary) : '';
   panelMeta.innerHTML = isExternal
     ? `
@@ -232,7 +234,8 @@ function showPanel(data) {
     ${data.class_name ? `<div class="info-row"><span class="info-label">Class</span><span class="info-val">${escapeHtml(data.class_name)}</span></div>` : ''}
     <div class="info-row"><span class="info-label">Flow</span><span class="info-val">${data.is_entrypoint ? '🟢 Entrypoint (flow root)' : 'depth ' + data.depth + ' from entrypoint'}</span></div>
     ${data.summary ? `<div class="info-row"><span class="info-label">Summary</span><span class="info-val">${safeSummary}</span></div>` : ''}
-    ${fileSum ? `<div class="info-row"><span class="info-label">${isSummaryNode ? 'Description' : 'File&nbsp;role'}</span><span class="info-val">${safeFileSum}</span></div>` : ''}
+    ${proxySummary ? `<div class="info-row"><span class="info-label">${summaryInfo.kind === 'topic' ? 'Topic&nbsp;summary' : 'Description'}</span><span class="info-val">${proxySummary}</span></div>` : ''}
+    ${!summaryInfo && fileSum ? `<div class="info-row"><span class="info-label">File&nbsp;role</span><span class="info-val">${safeFileSum}</span></div>` : ''}
   `;
 
   // External nodes have no source; hide the source block entirely for them.
@@ -375,24 +378,33 @@ document.getElementById('group-select').addEventListener('change', function () {
   groupMode = this.value === 'topic' && HAS_CANVAS_TOPICS ? 'topic' : 'file';
   gv.setGrouping(groupByFile);
   refreshGroupControls();
+  updateSummaryButtonState();
   hideGroupTooltip();
   applyLayout(document.getElementById('layout-select').value);
 });
 document.getElementById('topic-levels').addEventListener('click', function (e) {
   const btn = e.target.closest('.topic-level-btn');
-  if (!btn || summaryOnly) return;
+  if (!btn || (summaryOnly && summaryKind() !== 'topic')) return;
   topicLevel = Math.max(0, Math.min(TOPIC_GRAPH.maxLevel, Number(btn.dataset.level) || 0));
   refreshGroupControls();
   hideGroupTooltip();
+  if (summaryOnly) {
+    applySummaryNodeState();
+  }
   applyLayout(document.getElementById('layout-select').value);
 });
 
-// ── Summary-only view (file blocks with LLM descriptions) ─────────────────
-// Collapses each summarized file to a single node showing its LLM description.
-// Cross-file call edges are preserved via per-file proxy nodes.
+// ── Summary-only view (file/topic blocks with LLM descriptions) ───────────
+// Collapses each summarized file, or each visible Canvas topic level, to a
+// single node showing its LLM description. Cross-block call edges are preserved
+// by rewriting edge endpoints to the chosen proxy nodes.
 const HAS_FILE_SUMMARIES = Object.keys(FILE_SUMMARIES).length > 0;
+const HAS_TOPIC_SUMMARIES = Object.keys(TOPIC_GRAPH.topicSummaries).length > 0;
 const fileProxy = {};   // relative_file -> representative node id
 const proxyFileKey = {}; // node id -> relative_file
+const topicProxy = {};   // topic prefix at current level -> representative node id
+const proxyTopicKey = {}; // node id -> topic prefix
+const proxySummaryInfo = {}; // node id -> { kind, key, title, summary }
 const defaultLabelOf = (n) => (n.class_name ? n.class_name + '.' + n.name : n.name);
 
 function nodeFileKey(n) {
@@ -418,6 +430,26 @@ function summaryNodeLabel(fileKey) {
   return base + '\n' + wrapSummaryText(sum, 44);
 }
 
+function topicTitle(topicKey) {
+  return splitTopicPath(topicKey).slice(-1)[0] || topicKey;
+}
+
+function topicSummaryNodeLabel(topicKey) {
+  const sum = TOPIC_GRAPH.topicSummaries[topicKey] || '';
+  return topicTitle(topicKey) + '\n' + wrapSummaryText(sum, 44);
+}
+
+function nodeTopicKey(n) {
+  if (!n || n.language === 'external') return null;
+  const p = TOPIC_GRAPH.nodeTopicPath[n.id];
+  if (!p || !p.length) return null;
+  return p.slice(0, Math.min(topicLevel + 1, p.length)).join('>');
+}
+
+function clearObject(obj) {
+  Object.keys(obj).forEach((k) => { delete obj[k]; });
+}
+
 if (HAS_FILE_SUMMARIES) {
   const byFile = {};
   GRAPH_DATA.nodes.forEach((n) => {
@@ -435,7 +467,6 @@ if (HAS_FILE_SUMMARIES) {
     fileProxy[k] = nodes[0].id;
     proxyFileKey[nodes[0].id] = k;
   });
-  document.getElementById('btn-summary').style.display = '';
 }
 
 let summaryOnly = false;
@@ -444,51 +475,144 @@ let savedGroupByFile = true;
 const SUMMARY_NODE_FILL = '#2a2a42';
 let savedFillOf = null;
 
+function rebuildTopicProxies() {
+  clearObject(topicProxy);
+  clearObject(proxyTopicKey);
+  const byTopic = {};
+  GRAPH_DATA.nodes.forEach((n) => {
+    const k = nodeTopicKey(n);
+    if (!k || !TOPIC_GRAPH.topicSummaries[k]) return;
+    if (!byTopic[k]) byTopic[k] = [];
+    byTopic[k].push(n);
+  });
+  Object.entries(byTopic).forEach(([k, nodes]) => {
+    nodes.sort((a, b) => {
+      if (a.is_entrypoint !== b.is_entrypoint) return a.is_entrypoint ? -1 : 1;
+      if (a.depth !== b.depth) return a.depth - b.depth;
+      return (a.start_line || 0) - (b.start_line || 0);
+    });
+    topicProxy[k] = nodes[0].id;
+    proxyTopicKey[nodes[0].id] = k;
+  });
+}
+
+function summaryKind() {
+  return groupMode === 'topic' && HAS_TOPIC_SUMMARIES ? 'topic' : 'file';
+}
+
+function hasCurrentSummaryData() {
+  return summaryKind() === 'topic' ? HAS_TOPIC_SUMMARIES : HAS_FILE_SUMMARIES;
+}
+
+function updateSummaryButtonState() {
+  const btn = document.getElementById('btn-summary');
+  const hasAny = HAS_FILE_SUMMARIES || HAS_TOPIC_SUMMARIES;
+  btn.style.display = hasAny ? '' : 'none';
+  btn.disabled = hasAny && !hasCurrentSummaryData();
+  btn.title = summaryKind() === 'topic'
+    ? 'Show Canvas topic summaries instead of function names'
+    : 'Show file summaries instead of function names (requires LLM summaries)';
+}
+
+function applySummaryNodeState() {
+  const kind = summaryKind();
+  clearObject(proxySummaryInfo);
+  clearObject(proxyTopicKey);
+  if (kind === 'topic') rebuildTopicProxies();
+
+  gv.o.endpointOf = (id) => {
+    const n = nodeById[id];
+    if (!n) return id;
+    if (kind === 'topic') {
+      const tk = nodeTopicKey(n);
+      return (tk && topicProxy[tk]) ? topicProxy[tk] : id;
+    }
+    const fk = nodeFileKey(n);
+    return (fk && fileProxy[fk]) ? fileProxy[fk] : id;
+  };
+
+  if (!savedFillOf) savedFillOf = gv.o.fillOf;
+  gv.o.fillOf = (n) => (
+    proxySummaryInfo[n.id] ? SUMMARY_NODE_FILL : (savedFillOf ? savedFillOf(n) : n.color)
+  );
+
+  gv.forEachNode((id, n) => {
+    if (kind === 'topic') {
+      const tk = nodeTopicKey(n);
+      const proxyId = tk ? topicProxy[tk] : null;
+      if (tk && proxyId && id === proxyId) {
+        if (!savedLabels.has(id)) savedLabels.set(id, defaultLabelOf(n));
+        proxySummaryInfo[id] = {
+          kind: 'topic',
+          key: tk,
+          title: topicTitle(tk),
+          summary: TOPIC_GRAPH.topicSummaries[tk] || '',
+        };
+        gv.setNodeLabel(id, topicSummaryNodeLabel(tk));
+        gv.nodeClass(id, 'summary-node', true);
+        gv.showNode(id, true);
+      } else {
+        gv.nodeClass(id, 'summary-node', false);
+        if (savedLabels.has(id)) gv.setNodeLabel(id, savedLabels.get(id));
+        // Canvas topic summary mode is summary-only: hide original function and
+        // external nodes that do not represent a visible topic summary.
+        gv.showNode(id, false);
+      }
+      return;
+    }
+
+    if (n.language === 'external') return;
+    const fk = nodeFileKey(n);
+    if (fk && fileProxy[fk]) {
+      if (id === fileProxy[fk]) {
+        if (!savedLabels.has(id)) savedLabels.set(id, defaultLabelOf(n));
+        proxySummaryInfo[id] = {
+          kind: 'file',
+          key: fk,
+          title: fk,
+          summary: FILE_SUMMARIES[fk] || '',
+        };
+        gv.setNodeLabel(id, summaryNodeLabel(fk));
+        gv.nodeClass(id, 'summary-node', true);
+        gv.showNode(id, true);
+      } else {
+        gv.nodeClass(id, 'summary-node', false);
+        if (savedLabels.has(id)) gv.setNodeLabel(id, savedLabels.get(id));
+        gv.showNode(id, false);
+      }
+    }
+  });
+  gv._redraw();
+}
+
 function applySummaryMode(on) {
+  if (on && !hasCurrentSummaryData()) return;
   summaryOnly = on;
   const btn = document.getElementById('btn-summary');
   const groupBtn = document.getElementById('btn-group');
   const groupSelect = document.getElementById('group-select');
   const topicLevels = document.getElementById('topic-levels');
+  const allowTopicLevels = on && summaryKind() === 'topic';
   btn.classList.toggle('active', on);
   groupBtn.style.opacity = on ? '0.45' : '';
   groupBtn.style.pointerEvents = on ? 'none' : '';
   groupSelect.style.opacity = on ? '0.45' : '';
   groupSelect.style.pointerEvents = on ? 'none' : '';
-  topicLevels.style.opacity = on ? '0.45' : '';
-  topicLevels.style.pointerEvents = on ? 'none' : '';
+  topicLevels.style.opacity = on && !allowTopicLevels ? '0.45' : '';
+  topicLevels.style.pointerEvents = on && !allowTopicLevels ? 'none' : '';
+  if (allowTopicLevels) topicLevels.style.display = '';
 
   if (on) {
     savedGroupByFile = groupByFile;
     groupByFile = false;
     gv.setGrouping(false);
-    gv.o.endpointOf = (id) => {
-      const n = nodeById[id];
-      if (!n) return id;
-      const k = nodeFileKey(n);
-      return (k && fileProxy[k]) ? fileProxy[k] : id;
-    };
-    savedFillOf = gv.o.fillOf;
-    gv.o.fillOf = (n) => (proxyFileKey[n.id] ? SUMMARY_NODE_FILL : (savedFillOf ? savedFillOf(n) : n.color));
-    gv.forEachNode((id, n) => {
-      if (n.language === 'external') return;
-      const k = nodeFileKey(n);
-      if (k && fileProxy[k]) {
-        if (id === fileProxy[k]) {
-          if (!savedLabels.has(id)) savedLabels.set(id, defaultLabelOf(n));
-          gv.setNodeLabel(id, summaryNodeLabel(k));
-          gv.nodeClass(id, 'summary-node', true);
-          gv.showNode(id, true);
-        } else {
-          gv.showNode(id, false);
-        }
-      }
-    });
-    gv._redraw();
+    applySummaryNodeState();
   } else {
     gv.o.endpointOf = null;
     if (savedFillOf) gv.o.fillOf = savedFillOf;
     savedFillOf = null;
+    clearObject(proxySummaryInfo);
+    clearObject(proxyTopicKey);
     gv.forEachNode((id, n) => {
       gv.nodeClass(id, 'summary-node', false);
       if (savedLabels.has(id)) gv.setNodeLabel(id, savedLabels.get(id));
@@ -500,13 +624,15 @@ function applySummaryMode(on) {
     refreshGroupControls();
     gv._redraw();
   }
+  updateSummaryButtonState();
   applyLayout(document.getElementById('layout-select').value);
 }
 
 document.getElementById('btn-summary').addEventListener('click', function () {
-  if (!HAS_FILE_SUMMARIES) return;
+  if (!hasCurrentSummaryData()) return;
   applySummaryMode(!summaryOnly);
 });
+updateSummaryButtonState();
 
 // ── Flows: entrypoints + downstream isolation ─────────────────────────────
 // A "flow" is one entrypoint and everything reachable from it via call edges.

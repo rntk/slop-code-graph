@@ -160,6 +160,9 @@ def test_render_includes_canvas_topic_group_controls():
     assert "Canvas topics" in out
     assert "Setup>Validation" in out
     assert "Validates input." in out
+    assert "topicSummaryNodeLabel" in out
+    assert "Topic&nbsp;summary" in out
+    assert "Show Canvas topic summaries instead of function names" in out
 
 
 def test_render_embeds_flow_data():
