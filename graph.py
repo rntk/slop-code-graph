@@ -397,7 +397,12 @@ def main():
             try:
                 from src.canvas import build_canvas_data
 
-                canvas_data = build_canvas_data(graph, llm_client, cache_dir=cache_dir)
+                canvas_data = build_canvas_data(
+                    graph,
+                    llm_client,
+                    cache_dir=cache_dir,
+                    file_summaries=file_summaries,
+                )
                 if canvas_data:
                     print(
                         f"  Canvas: {canvas_data['stats']['topicCount']} topic(s) "

@@ -140,13 +140,20 @@ def _summarize_topic(
 
 
 def build_canvas_data(
-    graph: CallGraph, llm, cache_dir: Path | None = None
+    graph: CallGraph,
+    llm,
+    cache_dir: Path | None = None,
+    file_summaries: dict[str, str] | None = None,
 ) -> dict | None:
     """Run the full canvas pipeline; return the embeddable ``canvas`` dict.
 
+    ``file_summaries`` (keyed by ``relative_file``, as produced by the graph
+    file-summary pass) is optional context woven into the glued document's
+    headers so topic grouping has a module-level prior.
+
     Returns ``None`` when the flow has no summarizable source (nothing to render).
     """
-    lines, line_meta = build_flow_document(graph)
+    lines, line_meta = build_flow_document(graph, file_summaries=file_summaries)
     if not lines:
         return None
 
