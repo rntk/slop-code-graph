@@ -350,6 +350,10 @@ TREEMAP_SCRIPT = r"""
     tabs.forEach((t) => t.classList.toggle('active', t.dataset.view === view));
     // Graph-only controls are visible only on the call-graph tab.
     graphOnly.forEach((n) => { n.style.display = isGraph ? '' : 'none'; });
+    // topic-levels visibility is conditional on grouping mode; re-sync after tab switch.
+    if (isGraph && typeof window.refreshGroupControls === 'function') {
+      window.refreshGroupControls();
+    }
     if (isTree) {
       if (!built) { drillStack = [buildTree()]; built = true; }
       draw();

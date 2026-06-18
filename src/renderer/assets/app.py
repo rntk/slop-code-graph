@@ -344,6 +344,7 @@ function refreshGroupControls() {
     btn.classList.toggle('active', Number(btn.dataset.level) === topicLevel);
   });
 }
+window.refreshGroupControls = refreshGroupControls;
 
 function rebuildTopicLevelButtons() {
   const levels = document.getElementById('topic-levels');
