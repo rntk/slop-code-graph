@@ -551,15 +551,13 @@ function applySummaryNodeState() {
           title: topicTitle(tk),
           summary: TOPIC_GRAPH.topicSummaries[tk] || '',
         };
-        gv.setNodeLabel(id, topicSummaryNodeLabel(tk));
         gv.nodeClass(id, 'summary-node', true);
         gv.showNode(id, true);
+        gv.setNodeLabel(id, topicSummaryNodeLabel(tk));
       } else {
         gv.nodeClass(id, 'summary-node', false);
-        if (savedLabels.has(id)) gv.setNodeLabel(id, savedLabels.get(id));
-        // Canvas topic summary mode is summary-only: hide original function and
-        // external nodes that do not represent a visible topic summary.
         gv.showNode(id, false);
+        if (savedLabels.has(id)) gv.setNodeLabel(id, savedLabels.get(id));
       }
       return;
     }
@@ -575,13 +573,13 @@ function applySummaryNodeState() {
           title: fk,
           summary: FILE_SUMMARIES[fk] || '',
         };
-        gv.setNodeLabel(id, summaryNodeLabel(fk));
         gv.nodeClass(id, 'summary-node', true);
         gv.showNode(id, true);
+        gv.setNodeLabel(id, summaryNodeLabel(fk));
       } else {
         gv.nodeClass(id, 'summary-node', false);
-        if (savedLabels.has(id)) gv.setNodeLabel(id, savedLabels.get(id));
         gv.showNode(id, false);
+        if (savedLabels.has(id)) gv.setNodeLabel(id, savedLabels.get(id));
       }
     }
   });
@@ -624,8 +622,8 @@ function applySummaryMode(on) {
     clearObject(proxyTopicKey);
     gv.forEachNode((id, n) => {
       gv.nodeClass(id, 'summary-node', false);
-      if (savedLabels.has(id)) gv.setNodeLabel(id, savedLabels.get(id));
       gv.showNode(id, true);
+      if (savedLabels.has(id)) gv.setNodeLabel(id, savedLabels.get(id));
     });
     savedLabels.clear();
     groupByFile = savedGroupByFile;

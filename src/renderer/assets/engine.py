@@ -140,8 +140,18 @@ class GraphView {
         txt.appendChild(ts);
       });
       g.appendChild(txt);
-      const bb = txt.getBBox();
+      let bb = txt.getBBox();
       tw = bb.width; th = bb.height;
+      if (tw === 0 || th === 0) {
+        let maxWidth = 0;
+        lines.forEach((ln, idx) => {
+          const charW = idx === 0 ? 7.2 : 6.5;
+          const w = ln.length * charW;
+          if (w > maxWidth) maxWidth = w;
+        });
+        tw = maxWidth;
+        th = lines.length * 14;
+      }
     }
 
     const sz = sizeForShape(shape, tw, th);
@@ -272,7 +282,26 @@ class GraphView {
       ts.textContent = ln;
       txt.appendChild(ts);
     });
-    const bb = txt.getBBox();
+    const prevDisplay = g.style.display;
+    if (n.hidden) {
+      g.style.display = '';
+    }
+    let bb = txt.getBBox();
+    if (bb.width === 0 || bb.height === 0) {
+      let maxWidth = 0;
+      lines.forEach((ln, idx) => {
+        const charW = idx === 0 ? 7.2 : 6.5;
+        const w = ln.length * charW;
+        if (w > maxWidth) maxWidth = w;
+      });
+      bb = {
+        width: maxWidth,
+        height: lines.length * 14
+      };
+    }
+    if (n.hidden) {
+      g.style.display = prevDisplay;
+    }
     const sz = sizeForShape(shape, bb.width, bb.height);
     const fill = this.o.fillOf ? this.o.fillOf(n.data) : null;
     const newShp = shapeEl(shape, sz.w, sz.h);
