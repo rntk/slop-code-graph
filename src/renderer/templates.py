@@ -131,6 +131,7 @@ select.tb-btn {
   display: flex;
   flex: 1;
   overflow: hidden;
+  position: relative;
 }
 
 #cy {
@@ -219,19 +220,28 @@ select.tb-btn {
   white-space: pre-wrap;
 }
 
-/* ── Info panel ── */
+/* ── Info panel (floating overlay; does not reserve layout space) ── */
 #panel {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
   width: 340px;
-  min-width: 340px;
   background: #252526;
   border-left: 1px solid #3c3c3c;
   display: flex;
   flex-direction: column;
-  transform: translateX(340px);
+  z-index: 30;
+  box-shadow: -4px 0 16px rgba(0, 0, 0, 0.35);
+  transform: translateX(100%);
   transition: transform .2s ease;
   overflow: hidden;
+  pointer-events: none;
 }
-#panel.open { transform: translateX(0); }
+#panel.open {
+  transform: translateX(0);
+  pointer-events: auto;
+}
 
 #panel-header {
   display: flex;

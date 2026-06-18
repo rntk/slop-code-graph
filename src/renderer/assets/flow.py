@@ -5,7 +5,6 @@ so the renderer does not have to brace-escape the embedded code.
 """
 
 FLOW_STYLE = """
-#main { position: relative; }
 #flow-view {
   position: absolute; inset: 0; display: none; flex-direction: column;
   background: #1a1a2e; z-index: 20;

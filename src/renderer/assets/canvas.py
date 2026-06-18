@@ -32,9 +32,7 @@ CANVAS_STYLE = """
   overflow: hidden;
 }
 #canvas-view.open { display: flex; }
-/* When canvas is the active view, the info panel sibling must not reserve
-   layout space (its box would otherwise sit on the right, producing empty
-   unused area even while visually translated away). */
+/* Canvas has its own floating side card; hide the shared info panel. */
 #canvas-view.open ~ #panel { display: none !important; }
 
 /* ── Canvas toolbar (level switch + mode toggle) ─────────────────────────── */
