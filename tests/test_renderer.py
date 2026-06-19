@@ -123,6 +123,22 @@ def test_render_includes_flowchart_assets():
         assert marker in out, marker
 
 
+def test_render_includes_selected_node_focus_assets():
+    graph = CallGraph(
+        nodes=[_node(id="n1"), _node(id="n2", name="bar", qualified_name="bar")],
+        edges=[GraphEdge(id="e1", source="n1", target="n2", confidence="definite")],
+    )
+    out = render(graph, "t")
+
+    for marker in (
+        "focusNodeNeighborhood",
+        "Focused:",
+        "connected node",
+        "gv.edgeClass(id, 'highlighted', incident)",
+    ):
+        assert marker in out, marker
+
+
 def test_render_includes_summary_only_toggle():
     graph = CallGraph(nodes=[_node()], edges=[])
     out = render(graph, "t", file_summaries={"test.py": "Handles input validation."})

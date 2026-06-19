@@ -98,7 +98,10 @@ const gv = new GraphView(document.getElementById('cy'), {
   labelOf: (n) => (n.class_name ? n.class_name + '.' + n.name : n.name),
   fillOf: (n) => n.color,
   edgeClasses: (e) => e.confidence,
-  onNodeTap: (data) => showPanel(data),
+  onNodeTap: (data) => {
+    focusNodeNeighborhood(data.id);
+    showPanel(data);
+  },
   onBgTap: () => closePanel(),
 });
 
@@ -282,7 +285,11 @@ document.getElementById('btn-isolate').addEventListener('click', () => {
 
 function closePanel() {
   panel.classList.remove('open');
-  document.getElementById('stat-selection').textContent = '';
+  if (!flowActive) {
+    clearGraphFocus();
+    document.getElementById('btn-reset-flow').style.display = 'none';
+    document.getElementById('stat-selection').textContent = '';
+  }
   currentData = null;
   updateFlowBtn();
   gv.unselectAll();
@@ -296,6 +303,7 @@ panel.addEventListener('click', (e) => {
     const id = link.dataset.id;
     if (nodeById[id]) {
       gv.selectOnly(id);
+      focusNodeNeighborhood(id);
       gv.center([id], 100);
       showPanel(nodeById[id]);
     }
@@ -641,7 +649,47 @@ document.getElementById('btn-summary').addEventListener('click', function () {
 });
 updateSummaryButtonState();
 
-// ── Flows: entrypoints + downstream isolation ─────────────────────────────
+// ── Focus / flows ─────────────────────────────────────────────────────────
+// Selecting a node highlights the local subgraph around it: the node, its direct
+// callers, its direct callees, and the incident call edges. This keeps the full
+// graph available while making the selected function's immediate flow readable.
+let focusActive = false;
+function clearGraphFocus() {
+  gv.forEachNode((id) => {
+    gv.nodeClass(id, 'dimmed', false);
+    gv.nodeClass(id, 'highlighted', false);
+  });
+  gv.forEachEdge((id) => {
+    gv.edgeClass(id, 'dimmed', false);
+    gv.edgeClass(id, 'highlighted', false);
+  });
+  focusActive = false;
+}
+
+function focusNodeNeighborhood(nodeId) {
+  if (!nodeById[nodeId] || flowActive) return;
+  const keep = new Set([nodeId]);
+  (calleeMap[nodeId] || []).forEach((id) => keep.add(id));
+  (callerMap[nodeId] || []).forEach((id) => keep.add(id));
+  const incidentEdges = new Set();
+
+  gv.forEachEdge((id, e) => {
+    const incident = e.source === nodeId || e.target === nodeId;
+    if (incident) incidentEdges.add(id);
+    gv.edgeClass(id, 'highlighted', incident);
+    gv.edgeClass(id, 'dimmed', !incident);
+  });
+  gv.forEachNode((id) => {
+    gv.nodeClass(id, 'highlighted', id !== nodeId && keep.has(id));
+    gv.nodeClass(id, 'dimmed', !keep.has(id));
+  });
+  focusActive = true;
+  document.getElementById('btn-reset-flow').style.display = '';
+  const node = nodeById[nodeId];
+  document.getElementById('stat-selection').textContent =
+    `Focused: ${node ? node.qualified_name : nodeId} (${keep.size} connected node${keep.size !== 1 ? 's' : ''}, ${incidentEdges.size} edge${incidentEdges.size !== 1 ? 's' : ''})`;
+}
+
 // A "flow" is one entrypoint and everything reachable from it via call edges.
 // Isolating a flow dims every node/edge that is not part of that downstream
 // subtree, so the user (and, later, an LLM walking the flow) sees a single
@@ -665,12 +713,17 @@ function downstreamOf(rootId) {
 
 let flowActive = false;
 function isolateFlow(rootId) {
+  clearGraphFocus();
   const keep = downstreamOf(rootId);
   gv.forEachNode((id) => {
     gv.nodeClass(id, 'dimmed', !keep.has(id));
     gv.nodeClass(id, 'highlighted', false);
   });
-  gv.forEachEdge((id, e) => gv.edgeClass(id, 'dimmed', !(keep.has(e.source) && keep.has(e.target))));
+  gv.forEachEdge((id, e) => {
+    const inside = keep.has(e.source) && keep.has(e.target);
+    gv.edgeClass(id, 'dimmed', !inside);
+    gv.edgeClass(id, 'highlighted', inside);
+  });
   flowActive = true;
   document.getElementById('btn-reset-flow').style.display = '';
   gv.center([...keep], 60);
@@ -680,8 +733,7 @@ function isolateFlow(rootId) {
 }
 
 function resetFlow() {
-  gv.forEachNode((id) => { gv.nodeClass(id, 'dimmed', false); gv.nodeClass(id, 'highlighted', false); });
-  gv.forEachEdge((id) => gv.edgeClass(id, 'dimmed', false));
+  clearGraphFocus();
   flowActive = false;
   document.getElementById('btn-reset-flow').style.display = 'none';
   document.getElementById('stat-selection').textContent = '';
@@ -722,7 +774,12 @@ const searchCount = document.getElementById('search-count');
 
 function clearSearchHighlight() {
   gv.forEachNode((id) => { gv.nodeClass(id, 'dimmed', false); gv.nodeClass(id, 'highlighted', false); });
-  gv.forEachEdge((id) => gv.edgeClass(id, 'dimmed', false));
+  gv.forEachEdge((id) => {
+    gv.edgeClass(id, 'dimmed', false);
+    gv.edgeClass(id, 'highlighted', false);
+  });
+  focusActive = false;
+  if (!flowActive) document.getElementById('btn-reset-flow').style.display = 'none';
 }
 
 searchInput.addEventListener('input', function () {
@@ -771,12 +828,13 @@ searchResults.addEventListener('click', (e) => {
   if (nodeById[id]) {
     const focus = [id].concat(calleeMap[id] || [], callerMap[id] || []);
     gv.selectOnly(id);
+    clearSearchHighlight();
+    focusNodeNeighborhood(id);
     gv.center(focus, 80);
     showPanel(nodeById[id]);
   }
   searchResults.classList.remove('visible');
   searchInput.value = '';
-  clearSearchHighlight();
   searchCount.textContent = '';
 });
 
